@@ -1,0 +1,1339 @@
+import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
+import {
+  View,
+  StyleSheet,
+  FlatList,
+  KeyboardAvoidingView,
+  Platform,
+  Alert,
+} from 'react-native';
+import { useRouter, useFocusEffect } from 'expo-router';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import * as Haptics from 'expo-haptics';
+import { cyberTheme } from '@/constants/theme';
+import {
+  SOLO_WELCOME_MESSAGE,
+  GROUP_WELCOME_MESSAGE,
+  SETUP_REQUIRED_MESSAGE,
+  FORTUNE_TYPES,
+} from '@/constants/config';
+import InputGuideSection from '@/components/InputGuideSection';
+import ChatHeader from '@/components/ChatHeader';
+import CharacterPickerModal from '@/components/CharacterPickerModal';
+import MentionPickerModal from '@/components/MentionPickerModal';
+import ChatBubble from '@/components/ChatBubble';
+import ResultBubble from '@/components/results/ResultBubble';
+import ChatInputBar from '@/components/ChatInputBar';
+import RitualHost from '@/components/rituals/RitualHost';
+import CameraViewfinder from '@/components/CameraViewfinder';
+import RefusalModal from '@/components/RefusalModal';
+import ConversationShareModal, {
+  type SharePosterContent,
+} from '@/components/share/ConversationShareModal';
+import {
+  canShareAsQuote,
+  getConversationShareTitle,
+  getShareableMessages,
+  pickRecentForPoster,
+} from '@/utils/conversationShare';
+import SplashOverlay from '@/components/SplashOverlay';
+import TypingIndicator from '@/components/TypingIndicator';
+import SetupGateOverlay from '@/components/setup/SetupGateOverlay';
+import AlmanacModal from '@/components/almanac/AlmanacModal';
+import { useFortuneStore } from '@/stores/fortuneStore';
+import { useUserStore } from '@/stores/userStore';
+import { useSettingsStore } from '@/stores/settingsStore';
+import { useCharacterStore } from '@/stores/characterStore';
+import { useMemoryStore } from '@/stores/memoryStore';
+import { useAlmanacStore } from '@/stores/almanacStore';
+import { getSetupStatus } from '@/utils/setupReadiness';
+import { getDateKey } from '@/utils/dailyAlmanac';
+import { useLaunchStore } from '@/stores/launchStore';
+import { fortuneTell, fortuneFollowUp, createRefusalResult, extractRecentRatings } from '@/services/ai';
+import { getCharacterById, CHARACTERS } from '@/constants/characters';
+import { prepareRitual } from '@/rituals/prepareRitual';
+import { isFollowUpTurn, getLastFortuneResult } from '@/utils/conversationMode';
+import { orchestrateGroupTurn, generateFortuneCommentary } from '@/services/groupChat/orchestrate';
+import {
+  resolveCrossReadSource,
+  buildCrossReadPromptHint,
+  getCrossReadExcludeIds,
+} from '@/utils/crossRead';
+import { checkInputModeration } from '@/services/moderation';
+import { parseMentions } from '@/utils/parseMentions';
+import {
+  createEventId,
+  createTurnId,
+  deriveEventState,
+  mergeAnchorResult,
+  buildFactsSystemMessage,
+} from '@/utils/groupEventState';
+import { buildRestoredSessionMessages, getPersistableMessages } from '@/utils/conversationSession';
+import type {
+  ChatMessage,
+  FortuneType,
+  FortuneResult,
+  CharacterId,
+  RitualData,
+  FortuneSession,
+  GroupEventState,
+  GeneratedGroupReply,
+  ChatChannelMode,
+} from '@/types';
+
+function createMessage(
+  partial: Omit<ChatMessage, 'id' | 'createdAt'> & { id?: string }
+): ChatMessage {
+  return {
+    id: partial.id ?? Date.now().toString() + Math.random().toString(36).slice(2, 6),
+    createdAt: new Date().toISOString(),
+    ...partial,
+  };
+}
+
+function createInitialMessages(channelMode: ChatChannelMode): ChatMessage[] {
+  const content = channelMode === 'group' ? GROUP_WELCOME_MESSAGE : SOLO_WELCOME_MESSAGE;
+  return [createMessage({ role: 'system', content })];
+}
+
+function isFortuneType(type: string): type is FortuneType {
+  return FORTUNE_TYPES.some((m) => m.type === type);
+}
+
+/** 推断本轮应答角色，保证加载动画与最终结果一致 */
+function resolveRespondingCharacterId(options: {
+  channelMode: ChatChannelMode;
+  selectedCharacterId: CharacterId;
+  text?: string;
+  anchorResult?: FortuneResult | null;
+  hostCharacterId?: CharacterId;
+}): CharacterId {
+  if (options.hostCharacterId) return options.hostCharacterId;
+  if (options.anchorResult?.characterId) return options.anchorResult.characterId;
+  if (options.channelMode === 'group') {
+    const mentioned = parseMentions(options.text ?? '');
+    if (mentioned.length > 0) return mentioned[0];
+  }
+  return options.selectedCharacterId;
+}
+
+export default function ChatScreen() {
+  const router = useRouter();
+  const flatListRef = useRef<FlatList>(null);
+  const profile = useUserStore((s) => s.profile);
+  const profileLoaded = useUserStore((s) => s.isLoaded);
+  const settingsLoaded = useSettingsStore((s) => s.isLoaded);
+  const apiKey = useSettingsStore((s) => s.settings.apiKey);
+  const {
+    history,
+    isLoading,
+    setLoading,
+    addResult,
+    createChatSession,
+    updateSessionMessages,
+    pendingRestore,
+    setPendingRestore,
+  } = useFortuneStore();
+  const selectedCharacterId = useCharacterStore((s) => s.selectedId);
+  const setCharacter = useCharacterStore((s) => s.setCharacter);
+  const getMemoriesForPrompt = useMemoryStore((s) => s.getMemoriesForPrompt);
+  const markMemoriesUsed = useMemoryStore((s) => s.markMemoriesUsed);
+  const recordFortuneMemories = useMemoryStore((s) => s.recordFortuneMemories);
+  const recordFactsMemory = useMemoryStore((s) => s.recordFactsMemory);
+  const recordUserTextMemory = useMemoryStore((s) => s.recordUserTextMemory);
+  const selectedCharacter = getCharacterById(selectedCharacterId);
+  const almanacLoaded = useAlmanacStore((s) => s.isLoaded);
+  const almanacLastSeen = useAlmanacStore((s) => s.lastSeenDate);
+  const markAlmanacSeen = useAlmanacStore((s) => s.markSeenToday);
+
+  const [showSplash, setShowSplash] = useState(true);
+  const [channelMode, setChannelMode] = useState<ChatChannelMode>('solo');
+  const [mode, setMode] = useState<FortuneType>('travel');
+  const [messages, setMessages] = useState<ChatMessage[]>(() => createInitialMessages('solo'));
+  const [starterText, setStarterText] = useState<string | undefined>();
+  const [pendingImage, setPendingImage] = useState<string | null>(null);
+  const [cameraVisible, setCameraVisible] = useState(false);
+  const [ritualVisible, setRitualVisible] = useState(false);
+  const [apiReady, setApiReady] = useState(false);
+  const [refusalResult, setRefusalResult] = useState<FortuneResult | null>(null);
+  const [characterPickerVisible, setCharacterPickerVisible] = useState(false);
+  const [crossReadPickerVisible, setCrossReadPickerVisible] = useState(false);
+  const [crossReadSourceResult, setCrossReadSourceResult] = useState<FortuneResult | null>(null);
+  const [crossReadExcludeIds, setCrossReadExcludeIds] = useState<CharacterId[]>([]);
+  const [mentionPickerVisible, setMentionPickerVisible] = useState(false);
+  const [insertMention, setInsertMention] = useState<CharacterId | null>(null);
+  const [typingCharacterId, setTypingCharacterId] = useState<CharacterId | null>(null);
+  const [ritualHostId, setRitualHostId] = useState<CharacterId>(selectedCharacterId);
+  const [shareModalVisible, setShareModalVisible] = useState(false);
+  const [shareContent, setShareContent] = useState<SharePosterContent | null>(null);
+  const [almanacVisible, setAlmanacVisible] = useState(false);
+  const [almanacSkipDraw, setAlmanacSkipDraw] = useState(false);
+  const channelModeRef = useRef<ChatChannelMode>('solo');
+  const [ritualData, setRitualData] = useState<RitualData>({});
+  const pendingResultRef = useRef<FortuneResult | null>(null);
+  const pendingErrorRef = useRef<string | null>(null);
+  const pendingCommentaryRef = useRef(false);
+  const pendingTurnMetaRef = useRef<{ turnId: string; userInput: string } | null>(null);
+  const activeSessionIdRef = useRef<string | null>(null);
+  const eventIdRef = useRef<string>(createEventId());
+  const eventStateRef = useRef<GroupEventState | null>(null);
+  const skipSessionSaveRef = useRef(false);
+  const ritualHost = getCharacterById(ritualHostId);
+
+  const setupStatus = useMemo(
+    () =>
+      getSetupStatus({
+        settingsLoaded,
+        profileLoaded,
+        apiKey,
+        birthDate: profile?.bazi.birthDate,
+      }),
+    [settingsLoaded, profileLoaded, apiKey, profile?.bazi.birthDate]
+  );
+  const operationBlocked = !setupStatus.isReady;
+  const showSetupGate = operationBlocked && !showSplash && settingsLoaded && profileLoaded;
+
+  const goToSetup = useCallback(() => {
+    router.push(`/settings?section=${setupStatus.nextSection}`);
+  }, [router, setupStatus.nextSection]);
+
+  const guardOperation = useCallback(() => {
+    if (!operationBlocked) return true;
+    Alert.alert('尚未接入', setupStatus.hint, [
+      { text: '取消', style: 'cancel' },
+      { text: '去配置', onPress: goToSetup },
+    ]);
+    return false;
+  }, [operationBlocked, setupStatus.hint, goToSetup]);
+
+  const openCamera = useCallback(() => {
+    if (!guardOperation()) return;
+    setCameraVisible(true);
+  }, [guardOperation]);
+
+  useEffect(() => {
+    channelModeRef.current = channelMode;
+  }, [channelMode]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setShowSplash(false), 2200);
+    return () => clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    if (showSplash || !almanacLoaded || !settingsLoaded || !profileLoaded) return;
+
+    const today = getDateKey();
+    if (almanacLastSeen === today) return;
+
+    let cancelled = false;
+
+    const prepareTodayAlmanac = async () => {
+      const store = useAlmanacStore.getState();
+      if (!store.hasCached(today)) {
+        if (!setupStatus.isReady) return;
+        await store.ensureTodayAlmanac(profile ?? undefined);
+      }
+
+      if (cancelled) return;
+      if (!useAlmanacStore.getState().hasCached(today)) return;
+      if (useAlmanacStore.getState().lastSeenDate === today) return;
+
+      void markAlmanacSeen();
+      setAlmanacSkipDraw(false);
+      setAlmanacVisible(true);
+    };
+
+    void prepareTodayAlmanac();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    showSplash,
+    almanacLoaded,
+    settingsLoaded,
+    profileLoaded,
+    almanacLastSeen,
+    setupStatus.isReady,
+    profile,
+    markAlmanacSeen,
+  ]);
+
+  const openAlmanac = useCallback(() => {
+    router.push('/almanac');
+  }, [router]);
+
+  useEffect(() => {
+    if (!settingsLoaded || !profileLoaded) return;
+
+    const welcomeContent = setupStatus.isReady
+      ? channelMode === 'group'
+        ? GROUP_WELCOME_MESSAGE
+        : SOLO_WELCOME_MESSAGE
+      : SETUP_REQUIRED_MESSAGE;
+
+    setMessages((prev) => {
+      if (prev.length !== 1 || prev[0].role !== 'system') return prev;
+      if (prev[0].content === welcomeContent) return prev;
+      return [createMessage({ ...prev[0], content: welcomeContent })];
+    });
+  }, [settingsLoaded, profileLoaded, setupStatus.isReady, channelMode]);
+
+  const scrollToEnd = useCallback((animated = true) => {
+    requestAnimationFrame(() => {
+      flatListRef.current?.scrollToEnd({ animated });
+    });
+  }, []);
+
+  const showTypingIndicator = isLoading && !ritualVisible;
+  const activeRespondingCharacterId =
+    typingCharacterId ??
+    ritualHostId ??
+    selectedCharacterId;
+
+  useEffect(() => {
+    if (showTypingIndicator) scrollToEnd();
+  }, [showTypingIndicator, scrollToEnd]);
+
+  const appendMessages = useCallback(
+    (...msgs: ChatMessage[]) => {
+      setMessages((prev) => [...prev, ...msgs]);
+      scrollToEnd();
+    },
+    [scrollToEnd]
+  );
+
+  const ensureActiveSession = useCallback(async () => {
+    if (activeSessionIdRef.current) return activeSessionIdRef.current;
+
+    const sessionId = eventIdRef.current;
+    await createChatSession({
+      id: sessionId,
+      channelMode,
+      sceneMode: mode,
+    });
+    activeSessionIdRef.current = sessionId;
+    return sessionId;
+  }, [channelMode, createChatSession, mode]);
+
+  useEffect(() => {
+    const sessionId = activeSessionIdRef.current;
+    if (!sessionId || skipSessionSaveRef.current) {
+      skipSessionSaveRef.current = false;
+      return;
+    }
+
+    const persistable = getPersistableMessages(messages);
+    if (persistable.length === 0) return;
+
+    updateSessionMessages(sessionId, persistable);
+  }, [messages, updateSessionMessages]);
+
+  const resolvePromptMemories = useCallback(
+    (sceneMode: FortuneType) => getMemoriesForPrompt(sceneMode),
+    [getMemoriesForPrompt]
+  );
+
+  const appendGroupReply = useCallback(
+    (reply: GeneratedGroupReply, turnId: string) => {
+      appendMessages(
+        createMessage({
+          role: 'master',
+          content: reply.content,
+          mode,
+          characterId: reply.characterId,
+          eventId: eventIdRef.current,
+          turnId,
+          replyIndex: reply.replyIndex,
+          replyTarget: reply.target,
+          replyIntent: reply.intent,
+        })
+      );
+    },
+    [appendMessages, mode]
+  );
+
+  const runFortuneCommentary = useCallback(
+    async (turnId: string, userInput: string) => {
+      const currentMessages = await new Promise<ChatMessage[]>((resolve) => {
+        setMessages((prev) => {
+          resolve(prev);
+          return prev;
+        });
+      });
+
+      const eventState =
+        eventStateRef.current ??
+        deriveEventState(currentMessages, mode, eventIdRef.current);
+
+      try {
+        const promptMemories = resolvePromptMemories(mode);
+        await generateFortuneCommentary({
+          messages: currentMessages,
+          eventState,
+          userInput,
+          userProfile: profile ?? undefined,
+          userMemories: promptMemories,
+          fallbackHost: selectedCharacterId,
+          onReply: async (reply) => {
+            setTypingCharacterId(reply.characterId);
+            appendGroupReply(reply, turnId);
+          },
+        });
+        void markMemoriesUsed(promptMemories);
+      } catch {
+        // 点评失败不影响主流程
+      } finally {
+        setTypingCharacterId(null);
+      }
+    },
+    [appendGroupReply, selectedCharacterId, mode, profile, resolvePromptMemories, markMemoriesUsed]
+  );
+
+  const finishRitual = useCallback(() => {
+    setRitualVisible(false);
+    setApiReady(false);
+    setTypingCharacterId(null);
+
+    if (pendingResultRef.current) {
+      const result = pendingResultRef.current;
+      pendingResultRef.current = null;
+
+      if (result.rejected) {
+        setRefusalResult(result);
+        pendingCommentaryRef.current = false;
+        return;
+      }
+
+      activeSessionIdRef.current = activeSessionIdRef.current ?? eventIdRef.current;
+      if (channelModeRef.current === 'group') {
+        eventStateRef.current = mergeAnchorResult(
+          eventStateRef.current ?? deriveEventState(messages, mode, eventIdRef.current),
+          result
+        );
+      }
+
+      appendMessages(
+        createMessage({
+          role: 'master',
+          content: result.summary,
+          mode: result.type as FortuneType,
+          characterId: result.characterId ?? ritualHostId,
+          eventId: channelModeRef.current === 'group' ? eventIdRef.current : undefined,
+          result: {
+            ...result,
+            characterId: result.characterId ?? ritualHostId,
+          },
+        })
+      );
+
+      if (pendingCommentaryRef.current && channelModeRef.current === 'group') {
+        pendingCommentaryRef.current = false;
+        const meta = pendingTurnMetaRef.current;
+        pendingTurnMetaRef.current = null;
+        void runFortuneCommentary(meta?.turnId ?? createTurnId(), meta?.userInput ?? '');
+      } else {
+        pendingCommentaryRef.current = false;
+        pendingTurnMetaRef.current = null;
+      }
+    } else if (pendingErrorRef.current) {
+      const errMsg = pendingErrorRef.current;
+      pendingErrorRef.current = null;
+      pendingCommentaryRef.current = false;
+      appendMessages(
+        createMessage({
+          role: 'master',
+          content: errMsg,
+          mode,
+          characterId: ritualHostId,
+          eventId: eventIdRef.current,
+          isError: true,
+        })
+      );
+    }
+  }, [appendMessages, messages, mode, ritualHostId, runFortuneCommentary]);
+
+  const runSoloFortune = async (payload: { text?: string; imageUri?: string }) => {
+    const { text, imageUri } = payload;
+    const modeConfig = FORTUNE_TYPES.find((item) => item.type === mode)!;
+    const conversationHistory = messages;
+    const anchorResult = getLastFortuneResult(messages);
+    const followUp = isFollowUpTurn(messages);
+    const displayContent = text || `[${modeConfig.shortTitle}照片]`;
+
+    appendMessages(
+      createMessage({
+        role: 'user',
+        content: displayContent,
+        mode,
+        imageUri,
+        eventId: eventIdRef.current,
+      })
+    );
+
+    setRitualHostId(selectedCharacterId);
+
+    if (followUp && anchorResult) {
+      const responderId = resolveRespondingCharacterId({
+        channelMode: 'solo',
+        selectedCharacterId,
+        anchorResult,
+      });
+      setRitualHostId(responderId);
+      setTypingCharacterId(responderId);
+      setLoading(true);
+      const promptMemories = resolvePromptMemories(mode);
+      try {
+        const reply = await fortuneFollowUp(
+          responderId,
+          profile ?? undefined,
+          text,
+          { conversationHistory, anchorResult, userMemories: promptMemories },
+          imageUri
+        );
+        if (text?.trim()) {
+          void recordUserTextMemory(
+            text,
+            mode,
+            activeSessionIdRef.current ?? eventIdRef.current
+          );
+        }
+        void markMemoriesUsed(promptMemories);
+        appendMessages(
+          createMessage({
+            role: 'master',
+            content: reply,
+            mode,
+            characterId: responderId,
+          })
+        );
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      } catch (err) {
+        appendMessages(
+          createMessage({
+            role: 'master',
+            content: err instanceof Error ? err.message : '天机紊乱，请稍后再试',
+            mode,
+            characterId: responderId,
+            isError: true,
+          })
+        );
+      } finally {
+        setLoading(false);
+        setTypingCharacterId(null);
+      }
+      return;
+    }
+
+    setRitualHostId(selectedCharacterId);
+    setTypingCharacterId(selectedCharacterId);
+
+    setLoading(true);
+    setRitualVisible(true);
+    setApiReady(false);
+    pendingResultRef.current = null;
+    pendingErrorRef.current = null;
+    pendingCommentaryRef.current = false;
+
+    const prepared = prepareRitual(selectedCharacterId, mode, profile ?? undefined);
+    setRitualData(prepared.ritualData);
+
+    const promptMemories = resolvePromptMemories(mode);
+    try {
+      const result = await fortuneTell(
+        mode,
+        selectedCharacterId,
+        imageUri,
+        profile ?? undefined,
+        text,
+        {
+          meta: prepared.meta,
+          ritualContext: prepared.ritualContext,
+          conversationHistory,
+          recentRatings: extractRecentRatings(history),
+          userMemories: promptMemories,
+        }
+      );
+      await addResult(result, {
+        sessionId: activeSessionIdRef.current ?? eventIdRef.current,
+        channelMode: 'solo',
+        sceneMode: mode,
+      });
+      void recordFortuneMemories({
+        sceneMode: mode,
+        userInput: text,
+        result,
+        sessionId: activeSessionIdRef.current ?? eventIdRef.current,
+        messages: conversationHistory,
+      });
+      void markMemoriesUsed(promptMemories);
+      pendingResultRef.current = result;
+      setApiReady(true);
+      if (!result.rejected) {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      }
+    } catch (err) {
+      pendingErrorRef.current = err instanceof Error ? err.message : '天机紊乱，请稍后再试';
+      setApiReady(true);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const runGroupFortune = async (payload: { text?: string; imageUri?: string }) => {
+    const { text, imageUri } = payload;
+    const modeConfig = FORTUNE_TYPES.find((item) => item.type === mode)!;
+    const mentionedIds = parseMentions(text);
+    const turnId = createTurnId();
+    const eventState = deriveEventState(messages, mode, eventIdRef.current);
+    eventStateRef.current = eventState;
+    const conversationHistory = messages;
+    const displayContent = text || `[${modeConfig.shortTitle}照片]`;
+
+    appendMessages(
+      createMessage({
+        role: 'user',
+        content: displayContent,
+        mode,
+        imageUri,
+        eventId: eventIdRef.current,
+        turnId,
+      })
+    );
+
+    setLoading(true);
+    const initialResponder = resolveRespondingCharacterId({
+      channelMode: 'group',
+      selectedCharacterId,
+      text,
+    });
+    setRitualHostId(initialResponder);
+    setTypingCharacterId(initialResponder);
+
+    const promptMemories = resolvePromptMemories(mode);
+    const sessionId = activeSessionIdRef.current ?? eventIdRef.current;
+
+    try {
+      if (text?.trim()) {
+        void recordUserTextMemory(text, mode, sessionId);
+      }
+
+      const outcome = await orchestrateGroupTurn({
+        messages: conversationHistory,
+        eventState,
+        userInput: text ?? '',
+        mentionedIds,
+        imageUri,
+        userProfile: profile ?? undefined,
+        userMemories: promptMemories,
+        fallbackHost: selectedCharacterId,
+        onReply: async (reply) => {
+          setTypingCharacterId(reply.characterId);
+          appendGroupReply(reply, turnId);
+        },
+      });
+
+      eventStateRef.current = outcome.eventState;
+      void markMemoriesUsed(promptMemories);
+
+      if (outcome.plan.factsUpdate.length > 0) {
+        void recordFactsMemory(outcome.plan.factsUpdate, mode, sessionId);
+      }
+
+      const factsMessage = buildFactsSystemMessage(outcome.plan.factsUpdate);
+      if (factsMessage) {
+        appendMessages({ ...factsMessage, eventId: eventIdRef.current });
+      }
+
+      if (outcome.type === 'fortune') {
+        const hostId = outcome.hostCharacterId;
+        const host = getCharacterById(hostId);
+        setRitualHostId(hostId);
+        setTypingCharacterId(hostId);
+        pendingCommentaryRef.current = true;
+        pendingTurnMetaRef.current = { turnId, userInput: text ?? '' };
+
+        appendMessages(
+          createMessage({
+            role: 'system',
+            content: `${host.name}·${host.school} 准备为你起卦…`,
+            eventId: eventIdRef.current,
+            turnId,
+          })
+        );
+
+        setRitualVisible(true);
+        setApiReady(false);
+        pendingResultRef.current = null;
+        pendingErrorRef.current = null;
+
+        const prepared = prepareRitual(hostId, mode, profile ?? undefined);
+        setRitualData(prepared.ritualData);
+
+        const fortuneMemories = resolvePromptMemories(mode);
+        const result = await fortuneTell(
+          mode,
+          hostId,
+          imageUri,
+          profile ?? undefined,
+          text,
+          {
+            meta: prepared.meta,
+            ritualContext: prepared.ritualContext,
+            conversationHistory: [...conversationHistory],
+            recentRatings: extractRecentRatings(history),
+            userMemories: fortuneMemories,
+          }
+        );
+
+        await addResult(result, {
+          sessionId: activeSessionIdRef.current ?? eventIdRef.current,
+          channelMode: 'group',
+          sceneMode: mode,
+        });
+        void recordFortuneMemories({
+          sceneMode: mode,
+          userInput: text,
+          result,
+          sessionId: activeSessionIdRef.current ?? eventIdRef.current,
+          messages: conversationHistory,
+        });
+        void markMemoriesUsed(fortuneMemories);
+        pendingResultRef.current = result;
+        setApiReady(true);
+        if (!result.rejected) {
+          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        }
+        return;
+      }
+
+      if (outcome.replies.length === 0) {
+        throw new Error('群聊暂无有效回复，请稍后再试');
+      }
+
+      setTypingCharacterId(outcome.replies[0].characterId);
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } catch (err) {
+      appendMessages(
+        createMessage({
+          role: 'master',
+          content: err instanceof Error ? err.message : '天机紊乱，请稍后再试',
+          mode,
+          characterId: selectedCharacterId,
+          eventId: eventIdRef.current,
+          turnId,
+          isError: true,
+        })
+      );
+    } finally {
+      setLoading(false);
+      setTypingCharacterId(null);
+    }
+  };
+
+  const runCrossReadFortune = useCallback(
+    async (sourceResult: FortuneResult, targetCharacterId: CharacterId) => {
+      if (!guardOperation()) return;
+      if (channelModeRef.current !== 'solo') return;
+
+      const currentMessages = await new Promise<ChatMessage[]>((resolve) => {
+        setMessages((prev) => {
+          resolve(prev);
+          return prev;
+        });
+      });
+
+      const source = resolveCrossReadSource(currentMessages, sourceResult);
+      if (!source) {
+        Alert.alert('无法对照', '找不到原问题，请重新起卦后再试');
+        return;
+      }
+
+      if (source.sourceCharacterId === targetCharacterId) {
+        Alert.alert('提示', '请选择另一位大仙对照解读');
+        return;
+      }
+
+      await ensureActiveSession();
+
+      const target = getCharacterById(targetCharacterId);
+      const crossReadHint = buildCrossReadPromptHint(
+        source.sourceCharacterId,
+        source.sourceResult,
+        targetCharacterId
+      );
+
+      appendMessages(
+        createMessage({
+          role: 'system',
+          content: `同一问题 · 请求 ${target.name}·${target.school} 对照解卦`,
+          mode: source.mode,
+          eventId: eventIdRef.current,
+        })
+      );
+
+      setRitualHostId(targetCharacterId);
+      setTypingCharacterId(targetCharacterId);
+      setLoading(true);
+      setRitualVisible(true);
+      setApiReady(false);
+      pendingResultRef.current = null;
+      pendingErrorRef.current = null;
+      pendingCommentaryRef.current = false;
+
+      const prepared = prepareRitual(targetCharacterId, source.mode, profile ?? undefined);
+      setRitualData(prepared.ritualData);
+
+      const promptMemories = resolvePromptMemories(source.mode);
+      try {
+        const result = await fortuneTell(
+          source.mode,
+          targetCharacterId,
+          source.imageUri,
+          profile ?? undefined,
+          source.text,
+          {
+            meta: prepared.meta,
+            ritualContext: prepared.ritualContext,
+            conversationHistory: currentMessages,
+            recentRatings: extractRecentRatings(history),
+            crossReadHint,
+            userMemories: promptMemories,
+          }
+        );
+
+        const enriched: FortuneResult = {
+          ...result,
+          characterId: targetCharacterId,
+          questionId: source.questionId,
+          crossReadFrom: source.sourceResultId,
+          imageUri: source.imageUri ?? result.imageUri,
+        };
+
+        await addResult(enriched, {
+          sessionId: activeSessionIdRef.current ?? eventIdRef.current,
+          channelMode: 'solo',
+          sceneMode: source.mode,
+        });
+        void recordFortuneMemories({
+          sceneMode: source.mode,
+          userInput: source.text,
+          result: enriched,
+          sessionId: activeSessionIdRef.current ?? eventIdRef.current,
+          messages: currentMessages,
+        });
+        void markMemoriesUsed(promptMemories);
+        pendingResultRef.current = enriched;
+        setApiReady(true);
+        if (!enriched.rejected) {
+          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        }
+      } catch (err) {
+        pendingErrorRef.current = err instanceof Error ? err.message : '天机紊乱，请稍后再试';
+        setApiReady(true);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [
+      appendMessages,
+      ensureActiveSession,
+      profile,
+      history,
+      addResult,
+      resolvePromptMemories,
+      recordFortuneMemories,
+      markMemoriesUsed,
+      guardOperation,
+    ]
+  );
+
+  const runFortune = async (payload: { text?: string; imageUri?: string }) => {
+    if (!guardOperation()) return;
+
+    const { text, imageUri } = payload;
+    const modeConfig = FORTUNE_TYPES.find((item) => item.type === mode)!;
+
+    if (modeConfig.requiresText && !text?.trim()) {
+      Alert.alert('提示', '拍卦模式需要输入碎碎念');
+      return;
+    }
+    if (modeConfig.requiresText && !imageUri) {
+      Alert.alert('提示', '拍卦模式需要拍一张照片');
+      return;
+    }
+    if (!text?.trim() && !imageUri) {
+      Alert.alert('提示', '请拍照或输入内容');
+      return;
+    }
+
+    await ensureActiveSession();
+
+    if (text) {
+      const moderation = checkInputModeration(text);
+      if (moderation.blocked) {
+        const hostId =
+          channelMode === 'group'
+            ? (parseMentions(text)[0] ?? selectedCharacterId)
+            : selectedCharacterId;
+        const userMsg =
+          channelMode === 'group'
+            ? createMessage({
+                role: 'user',
+                content: text,
+                mode,
+                imageUri,
+                eventId: eventIdRef.current,
+                turnId: createTurnId(),
+              })
+            : createMessage({
+                role: 'user',
+                content: text,
+                mode,
+                imageUri,
+                eventId: eventIdRef.current,
+              });
+        appendMessages(userMsg);
+        const refusal = createRefusalResult(mode, hostId, moderation.refusalMessage!, imageUri);
+        await addResult(refusal, {
+          sessionId: activeSessionIdRef.current ?? eventIdRef.current,
+          channelMode,
+          sceneMode: mode,
+        });
+        setRefusalResult(refusal);
+        return;
+      }
+    }
+
+    if (channelMode === 'group') {
+      await runGroupFortune(payload);
+    } else {
+      await runSoloFortune(payload);
+    }
+  };
+
+  useEffect(() => {
+    if (!pendingRestore) return;
+
+    let cancelled = false;
+
+    (async () => {
+      const session = pendingRestore;
+      const restoredChannelMode = session.channelMode ?? 'solo';
+      const restoredSceneMode =
+        session.sceneMode ??
+        (session.result && isFortuneType(session.result.type)
+          ? session.result.type
+          : 'travel');
+
+      if (session.result?.characterId && restoredChannelMode === 'solo') {
+        await setCharacter(session.result.characterId);
+      }
+
+      if (cancelled) return;
+
+      setChannelMode(restoredChannelMode);
+      setMode(restoredSceneMode);
+      activeSessionIdRef.current = session.id;
+      eventIdRef.current = session.id;
+      skipSessionSaveRef.current = true;
+
+      const restored = buildRestoredSessionMessages(session);
+      setMessages(restored);
+      eventStateRef.current = deriveEventState(restored, restoredSceneMode, session.id);
+      setRitualHostId(session.result?.characterId ?? selectedCharacterId);
+      setPendingImage(null);
+      setStarterText(undefined);
+      setRefusalResult(session.result?.rejected ? session.result : null);
+      setPendingRestore(null);
+      scrollToEnd(false);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [pendingRestore, selectedCharacterId, setCharacter, setPendingRestore, scrollToEnd]);
+
+  const handleShareConversation = useCallback(async () => {
+    const shareable = getShareableMessages(messages);
+    if (shareable.length === 0) {
+      Alert.alert('暂无可分享内容', '先和大仙聊几句再来分享吧');
+      return;
+    }
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setShareContent({
+      kind: 'conversation',
+      messages: pickRecentForPoster(shareable),
+      channelMode,
+      title: getConversationShareTitle(
+        channelMode,
+        channelMode === 'solo' ? selectedCharacter.name : undefined
+      ),
+    });
+    setShareModalVisible(true);
+  }, [messages, channelMode, selectedCharacter.name]);
+
+  const handleQuoteShare = useCallback(async (message: ChatMessage) => {
+    if (!canShareAsQuote(message)) return;
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setShareContent({ kind: 'quote', message });
+    setShareModalVisible(true);
+  }, []);
+
+  const handleFortuneQuoteShare = useCallback(
+    async (result: FortuneResult) => {
+      const quoteMessage: ChatMessage = {
+        id: result.id,
+        role: 'master',
+        content: result.summary,
+        characterId: result.characterId ?? selectedCharacterId,
+        result,
+        createdAt: result.createdAt,
+      };
+      await handleQuoteShare(quoteMessage);
+    },
+    [handleQuoteShare, selectedCharacterId]
+  );
+
+  const handleCrossReadPress = useCallback(
+    (result: FortuneResult) => {
+      if (channelMode !== 'solo' || isLoading || ritualVisible) return;
+
+      const source = resolveCrossReadSource(messages, result);
+      if (!source) {
+        Alert.alert('无法对照', '找不到原问题，请重新起卦后再试');
+        return;
+      }
+
+      const excludeIds = getCrossReadExcludeIds(messages, source);
+      if (excludeIds.length >= CHARACTERS.length) {
+        Alert.alert('提示', '七位大仙都已解读过这个问题了');
+        return;
+      }
+
+      setCrossReadSourceResult(result);
+      setCrossReadExcludeIds(excludeIds);
+      setCrossReadPickerVisible(true);
+    },
+    [channelMode, isLoading, ritualVisible, messages]
+  );
+
+  const handleCrossReadSelect = useCallback(
+    (targetCharacterId: CharacterId) => {
+      if (!crossReadSourceResult) return;
+      void runCrossReadFortune(crossReadSourceResult, targetCharacterId);
+      setCrossReadSourceResult(null);
+      setCrossReadExcludeIds([]);
+    },
+    [crossReadSourceResult, runCrossReadFortune]
+  );
+
+  const renderItem = ({ item }: { item: ChatMessage }) => {
+    if (item.role === 'master' && item.result && !item.isError && !item.result.rejected) {
+      const result = {
+        ...item.result,
+        characterId: item.result.characterId ?? item.characterId ?? selectedCharacterId,
+      };
+      return (
+        <ResultBubble
+          result={result}
+          onLongPress={() => handleFortuneQuoteShare(result)}
+          onCrossRead={
+            channelMode === 'solo' ? () => handleCrossReadPress(result) : undefined
+          }
+          crossReadDisabled={isLoading || ritualVisible}
+        />
+      );
+    }
+    return <ChatBubble message={item} onLongPress={handleQuoteShare} />;
+  };
+
+  const resetChat = useCallback(
+    (nextChannelMode: ChatChannelMode = channelMode, systemNotice?: string) => {
+      activeSessionIdRef.current = null;
+      skipSessionSaveRef.current = true;
+      eventIdRef.current = createEventId();
+      eventStateRef.current = null;
+      const initial = createInitialMessages(nextChannelMode);
+      if (systemNotice) {
+        initial.push(createMessage({ role: 'system', content: systemNotice }));
+      }
+      setMessages(initial);
+      setPendingImage(null);
+      setStarterText(undefined);
+      setRefusalResult(null);
+      scrollToEnd(false);
+    },
+    [channelMode, scrollToEnd]
+  );
+
+  const consumeLaunch = useLaunchStore((s) => s.consumeLaunch);
+
+  useFocusEffect(
+    useCallback(() => {
+      const intent = consumeLaunch();
+      if (!intent) return;
+
+      const applyLaunch = async () => {
+        if (intent.channelMode) {
+          setChannelMode(intent.channelMode);
+          channelModeRef.current = intent.channelMode;
+        }
+        if (intent.characterId) {
+          await setCharacter(intent.characterId);
+          setRitualHostId(intent.characterId);
+        }
+        if (intent.mode) {
+          setMode(intent.mode);
+        }
+        if (intent.resetChat) {
+          resetChat(intent.channelMode ?? 'solo', intent.systemNotice);
+        } else if (intent.systemNotice) {
+          appendMessages(
+            createMessage({ role: 'system', content: intent.systemNotice })
+          );
+        }
+        if (intent.openCamera) {
+          requestAnimationFrame(() => setCameraVisible(true));
+        }
+      };
+
+      void applyLaunch();
+    }, [appendMessages, consumeLaunch, resetChat, setCharacter])
+  );
+
+  const handleNewChat = () => {
+    const hasConversation = messages.some((item) => item.role === 'user' || item.role === 'master');
+    const title = channelMode === 'group' ? '新对话' : '新起一卦';
+    const message =
+      channelMode === 'group' ? '清空当前群聊，开始新话题？' : '清空当前对话，开始新的占卜？';
+    if (!hasConversation) {
+      resetChat();
+      return;
+    }
+    Alert.alert(title, message, [
+      { text: '取消', style: 'cancel' },
+      { text: '确定', onPress: () => resetChat() },
+    ]);
+  };
+
+  const handleChannelModeChange = (nextMode: ChatChannelMode) => {
+    if (nextMode === channelMode) return;
+
+    const hasConversation = messages.some((item) => item.role === 'user' || item.role === 'master');
+    const applySwitch = () => {
+      setChannelMode(nextMode);
+      resetChat(
+        nextMode,
+        nextMode === 'group'
+          ? '已切换至七仙论道群聊。'
+          : `已切换至私聊模式，当前大仙：${selectedCharacter.name}。`
+      );
+    };
+
+    if (!hasConversation) {
+      applySwitch();
+      return;
+    }
+
+    Alert.alert(
+      '切换聊天模式',
+      '切换将清空当前对话，是否继续？',
+      [
+        { text: '取消', style: 'cancel' },
+        { text: '确定', onPress: applySwitch },
+      ]
+    );
+  };
+
+  const handleCenterPress = () => {
+    if (channelMode === 'group') {
+      setMentionPickerVisible(true);
+      return;
+    }
+    setCharacterPickerVisible(true);
+  };
+
+  const handleCharacterSelect = async (id: CharacterId) => {
+    if (id === selectedCharacterId) return;
+
+    const next = getCharacterById(id);
+    await setCharacter(id);
+    setRitualHostId(id);
+    resetChat(
+      'solo',
+      `已切换至 ${next.name}·${next.school}，新对话已开启，将以${next.school}形式为你解读。`
+    );
+  };
+
+  const handleMentionSelect = (id: CharacterId) => {
+    setInsertMention(id);
+  };
+
+  const handleRefusalClose = () => {
+    setRefusalResult(null);
+  };
+
+  const hasConversation = messages.some(
+    (item) => item.role === 'user' || item.role === 'master'
+  );
+
+  return (
+    <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
+      <SplashOverlay visible={showSplash} />
+
+      <ChatHeader
+        channelMode={channelMode}
+        characterId={selectedCharacterId}
+        onCenterPress={handleCenterPress}
+        onChannelModeChange={handleChannelModeChange}
+        onNewChatPress={handleNewChat}
+        onHistoryPress={() => router.push('/history')}
+        onGuidePress={() => router.push('/guide')}
+        onSettingsPress={() => router.push('/settings')}
+        onSharePress={handleShareConversation}
+        onAlmanacPress={openAlmanac}
+        disabled={isLoading || ritualVisible}
+      />
+
+      <KeyboardAvoidingView
+        style={styles.body}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        keyboardVerticalOffset={0}
+      >
+        <FlatList
+          ref={flatListRef}
+          data={messages}
+          keyExtractor={(item) => item.id}
+          renderItem={renderItem}
+          contentContainerStyle={styles.messageList}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator
+          ListFooterComponent={
+            showTypingIndicator ? (
+              <TypingIndicator characterId={activeRespondingCharacterId} />
+            ) : null
+          }
+        />
+
+        <View style={styles.inputSection}>
+          <InputGuideSection
+            mode={mode}
+            onModeChange={setMode}
+            onStarterSelect={(t) => setStarterText(t)}
+            onOpenCamera={openCamera}
+            disabled={isLoading || ritualVisible || operationBlocked}
+            showSceneCards={!hasConversation}
+          />
+          <ChatInputBar
+            mode={mode}
+            disabled={isLoading || ritualVisible || operationBlocked}
+            loading={isLoading || ritualVisible}
+            starterText={starterText}
+            pendingImage={pendingImage}
+            onPendingImageChange={setPendingImage}
+            showMentionButton={channelMode === 'group'}
+            onOpenMention={() => setMentionPickerVisible(true)}
+            onOpenCamera={openCamera}
+            insertMention={insertMention}
+            onMentionInserted={() => setInsertMention(null)}
+            onSubmit={runFortune}
+          />
+        </View>
+
+        {showSetupGate ? (
+          <SetupGateOverlay
+            status={setupStatus}
+            onConfigure={goToSetup}
+            onGuide={() => router.push('/guide')}
+          />
+        ) : null}
+      </KeyboardAvoidingView>
+
+      <CameraViewfinder
+        visible={cameraVisible}
+        onClose={() => setCameraVisible(false)}
+        onImagePicked={setPendingImage}
+      />
+
+      <RitualHost
+        ritual={ritualHost.ritual}
+        visible={ritualVisible}
+        ready={apiReady}
+        characterLabel={`${ritualHost.name}·${ritualHost.school}`}
+        ritualData={ritualData}
+        onComplete={finishRitual}
+      />
+
+      <CharacterPickerModal
+        visible={characterPickerVisible}
+        value={selectedCharacterId}
+        onSelect={handleCharacterSelect}
+        onClose={() => setCharacterPickerVisible(false)}
+      />
+
+      <CharacterPickerModal
+        visible={crossReadPickerVisible}
+        value={selectedCharacterId}
+        excludeIds={crossReadExcludeIds}
+        title="换大仙对照"
+        hint="同一问题，不同流派，看看结论是否撞车"
+        onSelect={handleCrossReadSelect}
+        onClose={() => {
+          setCrossReadPickerVisible(false);
+          setCrossReadSourceResult(null);
+          setCrossReadExcludeIds([]);
+        }}
+      />
+
+      <MentionPickerModal
+        visible={mentionPickerVisible}
+        onSelect={handleMentionSelect}
+        onClose={() => setMentionPickerVisible(false)}
+      />
+
+      <RefusalModal
+        visible={!!refusalResult}
+        result={refusalResult}
+        onClose={handleRefusalClose}
+      />
+
+      <ConversationShareModal
+        visible={shareModalVisible}
+        content={shareContent}
+        onClose={() => {
+          setShareModalVisible(false);
+          setShareContent(null);
+        }}
+      />
+
+      <AlmanacModal
+        visible={almanacVisible}
+        skipDraw={almanacSkipDraw}
+        onClose={() => setAlmanacVisible(false)}
+      />
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: cyberTheme.colors.background,
+  },
+  inputSection: {
+    flexShrink: 0,
+    width: '100%',
+    backgroundColor: cyberTheme.colors.background,
+  },
+  body: {
+    flex: 1,
+    position: 'relative',
+  },
+  messageList: {
+    paddingTop: 4,
+    paddingBottom: cyberTheme.spacing.lg,
+    flexGrow: 1,
+  },
+});
