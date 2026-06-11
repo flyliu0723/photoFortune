@@ -157,7 +157,7 @@ export const SETUP_REQUIRED_MESSAGE =
   '南天门尚未接入。请先配置 AI 算力并填写出生档案，再开始起卦。';
 
 export const SOLO_WELCOME_MESSAGE =
-  '点顶部大仙可换人。每位大师有专属仪式，同一场景不同玩法。';
+  '随便聊，或拍照、说「算一卦」正式起卦。点顶部可换大仙，每位有专属仪式。';
 
 export const GROUP_WELCOME_MESSAGE =
   '七仙论道群聊已开启。直接提问即可；想说「算一卦」才会正式起卦。输入框 @ 可指定大仙回复。';

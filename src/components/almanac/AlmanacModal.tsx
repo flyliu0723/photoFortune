@@ -12,12 +12,13 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
 import { cyberTheme } from '@/constants/theme';
-import { getDateKey } from '@/utils/dailyAlmanac';
+import { getDateKey, isAlmanacCacheValid } from '@/utils/dailyAlmanac';
 import { capturePosterImage, savePosterToAlbum } from '@/services/sharePoster';
 import { useAlmanacStore } from '@/stores/almanacStore';
 import DailyAlmanacCard from '@/components/almanac/DailyAlmanacCard';
 import AlmanacDrawOverlay from '@/components/almanac/AlmanacDrawOverlay';
 import AlmanacEmptyState from '@/components/almanac/AlmanacEmptyState';
+import type { UserProfile } from '@/types';
 
 type ViewPhase = 'draw' | 'detail';
 
@@ -25,6 +26,7 @@ interface AlmanacModalProps {
   visible: boolean;
   skipDraw?: boolean;
   date?: Date;
+  userProfile?: UserProfile | null;
   onClose: () => void;
 }
 
@@ -32,6 +34,7 @@ export default function AlmanacModal({
   visible,
   skipDraw = false,
   date,
+  userProfile,
   onClose,
 }: AlmanacModalProps) {
   const dateTime = date ? date.getTime() : null;
@@ -44,19 +47,45 @@ export default function AlmanacModal({
   const isToday = dateKey === todayKey;
   const isPast = dateKey < todayKey;
 
-  const almanac = useAlmanacStore((s) => s.cache[dateKey] ?? null);
+  const cachedEntry = useAlmanacStore((s) => s.cache[dateKey] ?? null);
   const isGeneratingToday = useAlmanacStore((s) => s.isGeneratingToday);
+  const ensureTodayAlmanac = useAlmanacStore((s) => s.ensureTodayAlmanac);
+  const markSeenToday = useAlmanacStore((s) => s.markSeenToday);
+
+  const almanac =
+    cachedEntry && (!isToday || isAlmanacCacheValid(cachedEntry, userProfile))
+      ? cachedEntry
+      : null;
 
   const [phase, setPhase] = useState<ViewPhase>(skipDraw ? 'detail' : 'draw');
   const [saving, setSaving] = useState(false);
   const cardRef = useRef<View>(null);
 
   useEffect(() => {
-    if (visible) {
-      setPhase(skipDraw ? 'detail' : 'draw');
-      setSaving(false);
-    }
+    if (!visible) return;
+    setPhase(skipDraw ? 'detail' : 'draw');
+    setSaving(false);
   }, [visible, skipDraw, dateKey]);
+
+  useEffect(() => {
+    if (!visible || !isToday) return;
+    if (almanac) {
+      void markSeenToday();
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      await ensureTodayAlmanac(userProfile ?? undefined);
+      if (!cancelled) {
+        void markSeenToday();
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [visible, isToday, dateKey, almanac, userProfile, ensureTodayAlmanac, markSeenToday]);
 
   const handleSave = async () => {
     if (saving || !almanac) return;
@@ -78,7 +107,7 @@ export default function AlmanacModal({
       return (
         <AlmanacEmptyState
           title="当日未求签"
-          message="天机只会在打开 App 的当天生成一次，过期不补。"
+          message="天机只会在点击当天的日历格时生成，过期不补。"
           icon="time-outline"
         />
       );
@@ -89,18 +118,17 @@ export default function AlmanacModal({
         <View style={styles.loadingWrap}>
           <ActivityIndicator size="large" color={cyberTheme.colors.primary} />
           <Text style={styles.loadingText}>南天门正在撰写今日黄历…</Text>
-          <Text style={styles.loadingHint}>结合你的画像，宜忌不重样</Text>
+          <Text style={styles.loadingHint}>结合你的生辰与画像，专属签运生成中</Text>
         </View>
       );
     }
 
     if (isToday && !almanac) {
       return (
-        <AlmanacEmptyState
-          title="今日签文尚未生成"
-          message="请从首页进入 App，系统会在每天首次打开时自动生成今日黄历。"
-          icon="sparkles-outline"
-        />
+        <View style={styles.loadingWrap}>
+          <ActivityIndicator size="large" color={cyberTheme.colors.primary} />
+          <Text style={styles.loadingText}>正在准备今日签筒…</Text>
+        </View>
       );
     }
 

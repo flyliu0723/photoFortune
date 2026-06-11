@@ -1,13 +1,6 @@
 import axios from 'axios';
 import { APP_CONFIG } from '@/constants/config';
-import {
-  FORTUNE_LEVELS,
-  FORTUNE_LEVEL_COLOR,
-  LUCKY_DIRECTIONS,
-  LUCKY_SEATS,
-  type AlmanacEntry,
-  type FortuneLevel,
-} from '@/constants/almanac';
+import type { AlmanacEntry } from '@/constants/almanac';
 import { loadAISettings } from '@/services/storage';
 import {
   extractChatCompletionContent,
@@ -20,6 +13,8 @@ import {
 } from '@/utils/almanacCopyRules';
 import {
   buildLocalFallbackAlmanac,
+  buildPersonalizedAlmanacCore,
+  getDateKey,
   type DailyAlmanac,
 } from '@/utils/dailyAlmanac';
 import type { UserProfile } from '@/types';
@@ -47,53 +42,58 @@ function parseEntries(raw?: Array<{ title?: string; desc?: string }>): AlmanacEn
     .slice(0, 3);
 }
 
-function normalizeLevel(raw?: string): FortuneLevel {
-  const found = FORTUNE_LEVELS.find((level) => raw?.includes(level));
-  return found ?? '中吉';
-}
-
-function normalizeDirection(raw?: string): string {
-  const found = LUCKY_DIRECTIONS.find((dir) => raw?.includes(dir));
-  return found ?? LUCKY_DIRECTIONS[0];
-}
-
-function normalizeLuckyNumber(raw?: number): number {
-  if (typeof raw === 'number' && raw >= 1 && raw <= 9) return Math.floor(raw);
-  return 7;
-}
-
-function normalizeLuckySeat(raw?: string): string {
-  const trimmed = raw?.trim();
-  if (trimmed && trimmed.length <= 14) return trimmed;
-  return LUCKY_SEATS[0];
+function buildAlmanacShell(date: Date, userProfile?: UserProfile): DailyAlmanac {
+  const dateKey = getDateKey(date);
+  const gregorian = dateKey.replace(/-/g, '.');
+  const weekday = WEEKDAYS[date.getDay()];
+  return {
+    dateKey,
+    gregorian,
+    weekday,
+    ganzhi: '',
+    level: '中吉',
+    levelColor: '#00FF88',
+    yi: [],
+    ji: [],
+    luckyNumber: 7,
+    luckyDirection: '正东',
+    luckySeat: '',
+  };
 }
 
 function buildAlmanacFromPayload(
   date: Date,
   payload: RawAlmanacPayload,
-  source: DailyAlmanac['source']
+  source: DailyAlmanac['source'],
+  userProfile?: UserProfile
 ): DailyAlmanac {
-  const fallback = buildLocalFallbackAlmanac(date);
+  const core = buildPersonalizedAlmanacCore(date, userProfile);
+  const fallback = buildLocalFallbackAlmanac(date, userProfile);
   const yi = parseEntries(payload.yi);
   const ji = parseEntries(payload.ji);
-  const level = normalizeLevel(payload.level);
 
   return {
-    ...fallback,
-    level,
-    levelColor: FORTUNE_LEVEL_COLOR[level],
+    ...buildAlmanacShell(date, userProfile),
+    level: core.level,
+    levelColor: fallback.levelColor,
     yi: yi.length >= 3 ? yi : fallback.yi,
     ji: ji.length >= 3 ? ji : fallback.ji,
-    luckyNumber: normalizeLuckyNumber(payload.luckyNumber),
-    luckyDirection: normalizeDirection(payload.luckyDirection),
-    luckySeat: normalizeLuckySeat(payload.luckySeat),
-    ganzhi: payload.ganzhi?.trim() || fallback.ganzhi,
+    luckyNumber: core.luckyNumber,
+    luckyDirection: core.luckyDirection,
+    luckySeat: core.luckySeat,
+    ganzhi: core.ganzhi,
     source,
     generatedAt: new Date().toISOString(),
+    profileFingerprint: core.profileFingerprint,
+    personalSeed: core.personalSeed,
   };
 }
 
-function parseAlmanacContent(content: string, date: Date): DailyAlmanac | null {
+function parseAlmanacContent(
+  content: string,
+  date: Date,
+  userProfile?: UserProfile
+): DailyAlmanac | null {
   try {
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return null;
@@ -102,7 +102,7 @@ function parseAlmanacContent(content: string, date: Date): DailyAlmanac | null {
     const ji = parseEntries(payload.ji);
     if (yi.length < 3 || ji.length < 3) return null;
     if (!validateAlmanacEntries(yi, ji)) return null;
-    return buildAlmanacFromPayload(date, payload, 'ai');
+    return buildAlmanacFromPayload(date, payload, 'ai', userProfile);
   } catch {
     return null;
   }
@@ -117,7 +117,7 @@ async function requestAlmanacFromAI(
   const apiUrl = normalizeChatCompletionsUrl(settings.apiUrl ?? APP_CONFIG.defaultApiUrl);
   const apiKey = settings.apiKey?.trim();
   const model = settings.model?.trim() ?? APP_CONFIG.defaultModel;
-  const temperature = Math.min(settings.temperature ?? APP_CONFIG.defaultTemperature, 0.92);
+  const temperature = Math.min(settings.temperature ?? APP_CONFIG.defaultTemperature, 0.88);
   const maxTokens = Math.min(settings.maxTokens ?? APP_CONFIG.defaultMaxTokens, 900);
 
   if (!apiKey) {
@@ -125,12 +125,14 @@ async function requestAlmanacFromAI(
   }
 
   const weekday = WEEKDAYS[date.getDay()];
-  const dateKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  const dateKey = getDateKey(date);
+  const personalizedCore = buildPersonalizedAlmanacCore(date, userProfile);
 
   const userContent = buildAlmanacUserPrompt({
     dateKey,
     weekday,
     userProfile,
+    personalizedCore,
     strictRetry,
   });
 
@@ -168,11 +170,11 @@ export async function generateAlmanacViaAI(
   userProfile?: UserProfile
 ): Promise<DailyAlmanac> {
   let content = await requestAlmanacFromAI(date, userProfile, false);
-  let parsed = parseAlmanacContent(content, date);
+  let parsed = parseAlmanacContent(content, date, userProfile);
 
   if (!parsed) {
     content = await requestAlmanacFromAI(date, userProfile, true);
-    parsed = parseAlmanacContent(content, date);
+    parsed = parseAlmanacContent(content, date, userProfile);
   }
 
   if (!parsed) {
@@ -183,9 +185,12 @@ export async function generateAlmanacViaAI(
 }
 
 /** AI 失败时的本地兜底，同样写入缓存，当天不再重试 AI */
-export function buildLocalFallbackWithMeta(date: Date): DailyAlmanac {
+export function buildLocalFallbackWithMeta(
+  date: Date,
+  userProfile?: UserProfile
+): DailyAlmanac {
   return {
-    ...buildLocalFallbackAlmanac(date),
+    ...buildLocalFallbackAlmanac(date, userProfile),
     source: 'local',
     generatedAt: new Date().toISOString(),
   };

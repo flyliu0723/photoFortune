@@ -24,7 +24,8 @@ export interface PreparedRitual {
 export function prepareRitual(
   characterId: CharacterId,
   scene: FortuneType,
-  profile?: UserProfile
+  profile?: UserProfile,
+  userInput?: string
 ): PreparedRitual {
   const character = getCharacterById(characterId);
   const meta: FortuneResultMeta = {};
@@ -56,13 +57,13 @@ export function prepareRitual(
       break;
     }
     case 'bazi_chart': {
-      const bazi = readBaziChart();
+      const bazi = readBaziChart(profile?.bazi);
       meta.bazi = bazi;
       ritualData.bazi = bazi;
       break;
     }
     case 'mbti_scan': {
-      const mbti = scanMbtiProfile(scene, profile?.mbtiType);
+      const mbti = scanMbtiProfile(scene, profile?.mbtiType, profile?.bazi);
       meta.mbti = mbti;
       ritualData.mbti = mbti;
       break;
@@ -79,7 +80,7 @@ export function prepareRitual(
 
   return {
     meta,
-    ritualContext: buildRitualContext(scene, meta, characterId, profile),
+    ritualContext: buildRitualContext(scene, meta, characterId, profile, userInput),
     ritualData,
   };
 }

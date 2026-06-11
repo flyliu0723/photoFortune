@@ -90,8 +90,27 @@ export default function BaziRitual({
         </Animated.View>
       ) : bazi ? (
         <View style={styles.resultCard}>
+          {bazi.fourPillars?.length ? (
+            <View style={styles.pillarResultRow}>
+              {PILLAR_LABELS.map((label, index) => (
+                <View key={label} style={styles.pillarResult}>
+                  <Text style={styles.pillarResultLabel}>{label}</Text>
+                  <Text style={styles.pillarResultChar}>{bazi.fourPillars?.[index] ?? '—'}</Text>
+                </View>
+              ))}
+            </View>
+          ) : null}
           <Text style={styles.dayMaster}>日主 · {bazi.dayMaster}</Text>
-          <Text style={styles.tenGod}>十神 · {bazi.tenGod}</Text>
+          <Text style={styles.tenGod}>
+            十神 · {bazi.tenGod}
+            {bazi.tenGodsSummary ? ` · ${bazi.tenGodsSummary}` : ''}
+          </Text>
+          {bazi.workplaceArchetype ? (
+            <Text style={styles.workplace}>职场 · {bazi.workplaceArchetype}</Text>
+          ) : null}
+          {bazi.workplaceTagline ? (
+            <Text style={styles.tagline}>「{bazi.workplaceTagline}」</Text>
+          ) : null}
           <Text style={styles.flowYear}>流年 · {bazi.flowYear}</Text>
           <Text style={styles.balance}>五行 · {bazi.elementBalance}</Text>
         </View>
@@ -134,6 +153,26 @@ const styles = StyleSheet.create({
     padding: cyberTheme.spacing.lg,
     gap: 8,
   },
+  pillarResultRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 4,
+    gap: 6,
+  },
+  pillarResult: {
+    flex: 1,
+    alignItems: 'center',
+    gap: 4,
+  },
+  pillarResultLabel: {
+    color: cyberTheme.colors.textDim,
+    fontSize: 11,
+  },
+  pillarResultChar: {
+    color: cyberTheme.colors.success,
+    fontSize: 16,
+    fontWeight: '700',
+  },
   dayMaster: {
     color: cyberTheme.colors.success,
     fontSize: 18,
@@ -144,6 +183,18 @@ const styles = StyleSheet.create({
     color: cyberTheme.colors.text,
     fontSize: 15,
     textAlign: 'center',
+  },
+  workplace: {
+    color: cyberTheme.colors.primary,
+    fontSize: 14,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  tagline: {
+    color: cyberTheme.colors.textDim,
+    fontSize: 13,
+    textAlign: 'center',
+    fontStyle: 'italic',
   },
   flowYear: {
     color: cyberTheme.colors.textDim,

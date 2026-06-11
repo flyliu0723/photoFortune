@@ -1,7 +1,19 @@
 import { getCharacterById } from '@/constants/characters';
+import { formatHuaxiaWisdomHint } from '@/constants/huaxiaWisdom';
+import { formatTenGodProfileForPrompt } from '@/constants/tenGods';
 import { getCharacterPrompt } from '@/prompts/characters';
+import {
+  getCharacterEmotionStyle,
+  GROUP_EMOTION_LAYER_PROMPT,
+} from '@/prompts/shared/emotion';
+import { readBaziChart } from '@/services/bazi';
+import {
+  formatYinyuanHintForPrompt,
+  shouldInjectYinyuanHint,
+} from '@/services/yinyuan';
 import type { CharacterId, DirectorReplyPlan, GroupEventState, GroupTurnMode } from '@/types';
 import { truncateForPrompt } from '@/utils/extractPlainReply';
+import { detectUserEmotionTone, formatEmotionHint } from '@/utils/userEmotion';
 import { formatUserMemories } from '@/utils/userMemory';
 import { formatUserProfile } from '@/utils/userProfile';
 
@@ -32,6 +44,10 @@ ${modeRule}
 - 字数 80～180 字，口语好懂，专有名词需跟一句大白话
 - 可以 @ 其他角色名，但不要模仿其他角色说话
 - 若锚点卦象偏凶，必须带劝慰和 1 条可照做的破解建议，禁止纯吓人
+
+${GROUP_EMOTION_LAYER_PROMPT}
+
+${getCharacterEmotionStyle(characterId)}
 
 ${getCharacterPrompt(characterId)}`;
 }
@@ -66,6 +82,28 @@ export function buildActorUserPrompt(options: {
     options.eventState.mode
   );
 
+  const tenGodHint = formatTenGodProfileForPrompt(
+    readBaziChart(options.userProfile?.bazi)
+  );
+  const shouldUseTenGodHint =
+    !!tenGodHint &&
+    (options.plan.characterId === 'bazi' || options.plan.characterId === 'mbti');
+
+  const emotionHint = formatEmotionHint(detectUserEmotionTone(options.userInput));
+
+  const huaxiaHint =
+    options.plan.characterId === 'bagua'
+      ? formatHuaxiaWisdomHint(options.userInput, options.eventState.mode)
+      : null;
+
+  const yinyuanHint = shouldInjectYinyuanHint(
+    options.plan.intent,
+    options.plan.characterId,
+    options.userInput
+  )
+    ? formatYinyuanHintForPrompt(options.userInput, options.userProfile)
+    : null;
+
   return [
     `你是 ${character.name}（${character.school}）。`,
     `本轮模式：${options.turnMode}`,
@@ -73,6 +111,10 @@ export function buildActorUserPrompt(options: {
     `你在回复：${formatTarget(options.plan)}`,
     `用户信息：${formatUserProfile(options.userProfile)}`,
     ...(memoryHint ? ['', memoryHint] : []),
+    ...(shouldUseTenGodHint ? ['', tenGodHint] : []),
+    ...(huaxiaHint ? ['', huaxiaHint] : []),
+    ...(yinyuanHint ? ['', yinyuanHint] : []),
+    ...(emotionHint ? ['', `--- 用户情绪提示 ---`, emotionHint] : []),
     '',
     '--- 已确立事实 ---',
     factsSection,

@@ -1,5 +1,6 @@
 import { formatHexagramLabel } from '@/services/bagua';
 import { formatTarotCardLabel } from '@/services/tarot';
+import { formatHuaxiaWisdomHint } from '@/constants/huaxiaWisdom';
 import { formatConstellationProfile } from '@/utils/constellationProfile';
 import { formatMbtiType } from '@/utils/userProfile';
 import type { CharacterId, FortuneResultMeta, FortuneType, UserProfile } from '@/types';
@@ -8,7 +9,8 @@ export function buildRitualContext(
   scene: FortuneType,
   meta?: FortuneResultMeta,
   characterId?: CharacterId,
-  userProfile?: UserProfile
+  userProfile?: UserProfile,
+  userInput?: string
 ): string {
   if (!meta) return '';
 
@@ -27,11 +29,16 @@ export function buildRitualContext(
 
   if (meta.hexagram) {
     const hex = meta.hexagram;
+    const huaxiaHint =
+      characterId === 'bagua' || scene === 'work'
+        ? formatHuaxiaWisdomHint(userInput ?? '', scene)
+        : null;
     sections.push(
       '【本次卦象 · 已由邵夫子·云端分节起卦，请严格基于此解读】',
       `${hex.sceneLabel}：${formatHexagramLabel(hex)}`,
       `卦象符号：${hex.symbol}（上${hex.upperTrigram}下${hex.lowerTrigram}）`,
-      '要求：diagnosis 中必须引用卦名、动爻与体用关系，并与照片细节建立取象链。'
+      ...(huaxiaHint ? [huaxiaHint] : []),
+      '要求：diagnosis 中必须引用卦名、动爻与体用，并与照片细节建立取象链；工作场景须用老祖宗框架翻译职场困局。'
     );
   }
 
@@ -75,13 +82,22 @@ export function buildRitualContext(
 
   if (meta.bazi) {
     const bz = meta.bazi;
+    const pillarLine = bz.fourPillars?.length
+      ? `四柱：${bz.fourPillars.join(' · ')}`
+      : undefined;
     sections.push(
       '【本次八字提要 · 已由八字神算·袁天罡排盘，请严格基于此解读】',
+      ...(pillarLine ? [pillarLine] : []),
       `日主：${bz.dayMaster}`,
-      `十神：${bz.tenGod}`,
+      `十神：${bz.tenGod}${bz.tenGodsSummary ? `（分布：${bz.tenGodsSummary}）` : ''}`,
+      ...(bz.workplaceArchetype ? [`赛博职场原型：${bz.workplaceArchetype}`] : []),
+      ...(bz.workplaceTagline ? [`十神口头禅：${bz.workplaceTagline}`] : []),
+      ...(bz.tenGodBoardroom ? [bz.tenGodBoardroom] : []),
       `流年：${bz.flowYear}`,
       `五行态势：${bz.elementBalance}`,
-      '要求：diagnosis 中必须引用日主、十神与流年，结合用户生辰做职场运势解读。'
+      bz.isComputed
+        ? '要求：diagnosis 中必须引用四柱、主导十神、职场原型与流年，把十神翻译成打工人能懂的话（如七杀=卷王、食神=摸鱼）。'
+        : '要求：用户尚未填写完整生辰，可结合日主十神做娱乐化解读，并提醒用户补全档案后会更准。'
     );
   }
 

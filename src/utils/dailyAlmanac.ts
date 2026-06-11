@@ -8,6 +8,11 @@ import {
   type AlmanacEntry,
   type FortuneLevel,
 } from '@/constants/almanac';
+import {
+  buildAlmanacSeed,
+  buildProfileFingerprint,
+} from '@/utils/almanacPersonalization';
+import type { UserProfile } from '@/types';
 
 export interface DailyAlmanac {
   /** 当日键，格式 YYYY-MM-DD，用于缓存与每日 gating */
@@ -36,20 +41,15 @@ export interface DailyAlmanac {
   source?: 'ai' | 'local';
   /** 生成时间 ISO */
   generatedAt?: string;
+  /** 生成时用户档案指纹，用于档案变更后失效重算 */
+  profileFingerprint?: string;
+  /** 个性化种子（调试/校验用） */
+  personalSeed?: number;
 }
 
 const WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
 const TIAN_GAN = ['甲', '乙', '丙', '丁', '戊', '己', '庚', '辛', '壬', '癸'];
 const DI_ZHI = ['子', '丑', '寅', '卯', '辰', '巳', '午', '未', '申', '酉', '戌', '亥'];
-
-/** 把 YYYY-MM-DD 转成稳定数字种子 */
-function dateSeed(dateKey: string): number {
-  let hash = 0;
-  for (let i = 0; i < dateKey.length; i++) {
-    hash = (hash * 31 + dateKey.charCodeAt(i)) | 0;
-  }
-  return Math.abs(hash);
-}
 
 /** 线性同余，确定性伪随机，保证同种子结果一致 */
 function nextSeed(seed: number): number {
@@ -80,36 +80,81 @@ export function getDateKey(date: Date = new Date()): string {
   return `${y}-${m}-${d}`;
 }
 
+export interface PersonalizedAlmanacCore {
+  personalSeed: number;
+  profileFingerprint: string;
+  level: FortuneLevel;
+  levelColor: string;
+  yi: AlmanacEntry[];
+  ji: AlmanacEntry[];
+  luckyNumber: number;
+  luckyDirection: string;
+  luckySeat: string;
+  ganzhi: string;
+}
+
+/** 由日期 + 用户档案导出确定性黄历核心字段 */
+export function buildPersonalizedAlmanacCore(
+  date: Date,
+  userProfile?: UserProfile | null
+): PersonalizedAlmanacCore {
+  const dateKey = getDateKey(date);
+  const profileFingerprint = buildProfileFingerprint(userProfile);
+  const personalSeed = buildAlmanacSeed(dateKey, userProfile);
+  const level = FORTUNE_LEVELS[personalSeed % FORTUNE_LEVELS.length];
+
+  return {
+    personalSeed,
+    profileFingerprint,
+    level,
+    levelColor: FORTUNE_LEVEL_COLOR[level],
+    yi: pickEntries(ALMANAC_YI, personalSeed, 3),
+    ji: pickEntries(ALMANAC_JI, personalSeed + 17, 3),
+    luckyNumber: (personalSeed % 9) + 1,
+    luckyDirection: LUCKY_DIRECTIONS[personalSeed % LUCKY_DIRECTIONS.length],
+    luckySeat: LUCKY_SEATS[personalSeed % LUCKY_SEATS.length],
+    ganzhi: `${TIAN_GAN[personalSeed % TIAN_GAN.length]}${DI_ZHI[personalSeed % DI_ZHI.length]}日`,
+  };
+}
+
 /**
  * 本地确定性黄历（兜底用，非 AI）。
- * 同一天多次调用结果完全一致。
+ * 同人同日结果恒定，不同用户/不同日不同。
  */
-export function buildLocalFallbackAlmanac(date: Date = new Date()): DailyAlmanac {
+export function buildLocalFallbackAlmanac(
+  date: Date = new Date(),
+  userProfile?: UserProfile | null
+): DailyAlmanac {
   const dateKey = getDateKey(date);
-  const seed = dateSeed(dateKey);
-
-  const level = FORTUNE_LEVELS[seed % FORTUNE_LEVELS.length];
-  const yi = pickEntries(ALMANAC_YI, seed, 3);
-  const ji = pickEntries(ALMANAC_JI, seed + 17, 3);
-
+  const core = buildPersonalizedAlmanacCore(date, userProfile);
   const gregorian = dateKey.replace(/-/g, '.');
   const weekday = WEEKDAYS[date.getDay()];
-  const ganzhi = `${TIAN_GAN[seed % TIAN_GAN.length]}${DI_ZHI[seed % DI_ZHI.length]}日`;
 
   return {
     dateKey,
     gregorian,
     weekday,
-    ganzhi,
-    level,
-    levelColor: FORTUNE_LEVEL_COLOR[level],
-    yi,
-    ji,
-    luckyNumber: (seed % 9) + 1,
-    luckyDirection: LUCKY_DIRECTIONS[seed % LUCKY_DIRECTIONS.length],
-    luckySeat: LUCKY_SEATS[seed % LUCKY_SEATS.length],
+    ganzhi: core.ganzhi,
+    level: core.level,
+    levelColor: core.levelColor,
+    yi: core.yi,
+    ji: core.ji,
+    luckyNumber: core.luckyNumber,
+    luckyDirection: core.luckyDirection,
+    luckySeat: core.luckySeat,
     source: 'local',
+    profileFingerprint: core.profileFingerprint,
+    personalSeed: core.personalSeed,
   };
+}
+
+/** 缓存是否与当前用户档案匹配 */
+export function isAlmanacCacheValid(
+  almanac: DailyAlmanac | null | undefined,
+  userProfile?: UserProfile | null
+): boolean {
+  if (!almanac) return false;
+  return almanac.profileFingerprint === buildProfileFingerprint(userProfile);
 }
 
 /** @deprecated 使用 buildLocalFallbackAlmanac 或 almanacStore 缓存 */

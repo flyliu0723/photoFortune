@@ -1,11 +1,14 @@
 import { create } from 'zustand';
-import { ASYNC_KEYS, loadAsyncData, saveAsyncData } from '@/services/storage';
 import { APP_CONFIG } from '@/constants/config';
-import {
-  migrateHistoryToSessions,
-  normalizeFortuneSession,
-} from '@/utils/conversationSession';
+import { normalizeFortuneSession } from '@/utils/conversationSession';
 import { buildSessionSummaryFromMessages } from '@/utils/sessionDisplay';
+import {
+  clearFortuneSessions,
+  getFortuneSession,
+  initSessionDb,
+  listFortuneSessions,
+  upsertFortuneSession,
+} from '@/services/sessionDb';
 import type { ChatChannelMode, ChatMessage, FortuneResult, FortuneSession, FortuneType } from '@/types';
 
 export interface AddResultOptions {
@@ -28,6 +31,7 @@ interface FortuneState {
   error: string | null;
   isLoaded: boolean;
   loadHistory: () => Promise<void>;
+  waitUntilLoaded: () => Promise<void>;
   createChatSession: (params: CreateChatSessionParams) => Promise<FortuneSession>;
   addResult: (result: FortuneResult, options?: AddResultOptions) => Promise<void>;
   updateSessionMessages: (id: string, messages: ChatMessage[]) => Promise<void>;
@@ -37,6 +41,8 @@ interface FortuneState {
   setError: (error: string | null) => void;
   clearHistory: () => Promise<void>;
 }
+
+let loadPromise: Promise<void> | null = null;
 
 function upsertHistory(history: FortuneSession[], session: FortuneSession): FortuneSession[] {
   return [
@@ -54,14 +60,46 @@ export const useFortuneStore = create<FortuneState>((set, get) => ({
   isLoaded: false,
 
   loadHistory: async () => {
-    const raw = await loadAsyncData<unknown>(ASYNC_KEYS.FORTUNE_HISTORY);
-    const history = migrateHistoryToSessions(raw);
-    set({ history, isLoaded: true });
+    if (loadPromise) {
+      await loadPromise;
+      return;
+    }
+
+    loadPromise = (async () => {
+      set({ isLoading: true, error: null });
+      try {
+        await initSessionDb();
+        const history = await listFortuneSessions();
+        set({ history, isLoaded: true });
+      } catch (err) {
+        set({
+          error: err instanceof Error ? err.message : '历史记录加载失败',
+          isLoaded: true,
+        });
+      } finally {
+        set({ isLoading: false });
+      }
+    })();
+
+    await loadPromise;
+  },
+
+  waitUntilLoaded: async () => {
+    if (get().isLoaded) return;
+    await get().loadHistory();
   },
 
   createChatSession: async (params) => {
-    const existing = get().history.find((item) => item.id === params.id);
-    if (existing) return existing;
+    await get().waitUntilLoaded();
+
+    const cached = get().history.find((item) => item.id === params.id);
+    if (cached) return cached;
+
+    const stored = await getFortuneSession(params.id);
+    if (stored) {
+      set({ history: upsertHistory(get().history, stored) });
+      return stored;
+    }
 
     const now = new Date().toISOString();
     const session = normalizeFortuneSession({
@@ -73,15 +111,18 @@ export const useFortuneStore = create<FortuneState>((set, get) => ({
       createdAt: now,
     });
 
-    const history = upsertHistory(get().history, session);
-    await saveAsyncData(ASYNC_KEYS.FORTUNE_HISTORY, history);
-    set({ history });
+    await upsertFortuneSession(session);
+    set({ history: upsertHistory(get().history, session) });
     return session;
   },
 
   addResult: async (result, options) => {
+    await get().waitUntilLoaded();
+
     const sessionId = options?.sessionId ?? result.id;
-    const existing = get().history.find((item) => item.id === sessionId);
+    const existing =
+      get().history.find((item) => item.id === sessionId) ??
+      (await getFortuneSession(sessionId));
     const summary = buildSessionSummaryFromMessages(existing?.messages ?? []);
 
     const session = normalizeFortuneSession({
@@ -104,13 +145,18 @@ export const useFortuneStore = create<FortuneState>((set, get) => ({
       createdAt: existing?.createdAt ?? result.createdAt,
     });
 
-    const history = upsertHistory(get().history, session);
-    await saveAsyncData(ASYNC_KEYS.FORTUNE_HISTORY, history);
-    set({ history, currentResult: result });
+    await upsertFortuneSession(session);
+    set({
+      history: upsertHistory(get().history, session),
+      currentResult: result,
+    });
   },
 
   updateSessionMessages: async (id, messages) => {
-    const existing = get().history.find((item) => item.id === id);
+    await get().waitUntilLoaded();
+
+    const existing =
+      get().history.find((item) => item.id === id) ?? (await getFortuneSession(id));
     if (!existing) return;
 
     const summary = buildSessionSummaryFromMessages(messages);
@@ -122,9 +168,8 @@ export const useFortuneStore = create<FortuneState>((set, get) => ({
       updatedAt: new Date().toISOString(),
     });
 
-    const history = get().history.map((item) => (item.id === id ? session : item));
-    await saveAsyncData(ASYNC_KEYS.FORTUNE_HISTORY, history);
-    set({ history });
+    await upsertFortuneSession(session);
+    set({ history: upsertHistory(get().history, session) });
   },
 
   setCurrentResult: (result) => set({ currentResult: result }),
@@ -133,7 +178,8 @@ export const useFortuneStore = create<FortuneState>((set, get) => ({
   setError: (error) => set({ error }),
 
   clearHistory: async () => {
-    await saveAsyncData(ASYNC_KEYS.FORTUNE_HISTORY, []);
+    await get().waitUntilLoaded();
+    await clearFortuneSessions();
     set({ history: [], currentResult: null });
   },
 }));

@@ -90,11 +90,35 @@ export interface ZodiacAspect {
   userSign?: string;
 }
 
+export interface BaziPillarPair {
+  stem: string;
+  branch: string;
+}
+
 export interface BaziReading {
   dayMaster: string;
   tenGod: string;
   flowYear: string;
   elementBalance: string;
+  /** 四柱字符串，顺序：年、月、日、时 */
+  fourPillars?: string[];
+  /** 结构化四柱 */
+  pillars?: {
+    year: BaziPillarPair;
+    month: BaziPillarPair;
+    day: BaziPillarPair;
+    hour: BaziPillarPair;
+  };
+  /** 十神分布摘要，供 AI 引用 */
+  tenGodsSummary?: string;
+  /** 赛博职场人格原型 */
+  workplaceArchetype?: string;
+  /** 主导十神口头禅 */
+  workplaceTagline?: string;
+  /** 十神议事厅摘要 */
+  tenGodBoardroom?: string;
+  /** 是否基于用户生辰真实排盘 */
+  isComputed?: boolean;
 }
 
 export interface MbtiReading {
@@ -102,6 +126,20 @@ export interface MbtiReading {
   dimension: string;
   workplaceArchetype: string;
   sceneLabel: string;
+}
+
+export type YinyuanMode = 'match' | 'peach' | 'fortune_stick';
+
+export interface YinyuanReading {
+  mode: YinyuanMode;
+  title: string;
+  score: number;
+  rating: string;
+  summary: string;
+  highlights: string[];
+  caution?: string;
+  partnerLabel: string;
+  isComputed: boolean;
 }
 
 export interface MeritReading {

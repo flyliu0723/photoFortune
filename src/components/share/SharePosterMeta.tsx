@@ -73,10 +73,15 @@ export default function SharePosterMeta({ meta }: SharePosterMetaProps) {
 
   if (meta.bazi) {
     const bz = meta.bazi;
+    const pillarText = bz.fourPillars?.length ? bz.fourPillars.join(' · ') : undefined;
     return (
       <View style={styles.block}>
         <Text style={[styles.label, { color: cyberTheme.colors.success }]}>八字提要</Text>
+        {pillarText ? <Text style={styles.dim}>{pillarText}</Text> : null}
         <Text style={styles.main}>日主 {bz.dayMaster} · 十神 {bz.tenGod}</Text>
+        {bz.workplaceArchetype ? (
+          <Text style={styles.dim}>职场 {bz.workplaceArchetype}</Text>
+        ) : null}
         <Text style={styles.dim}>流年 {bz.flowYear} · {bz.elementBalance}</Text>
       </View>
     );

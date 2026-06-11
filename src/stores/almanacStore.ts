@@ -1,7 +1,8 @@
 import { create } from 'zustand';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { getDateKey } from '@/utils/dailyAlmanac';
+import { getDateKey, isAlmanacCacheValid } from '@/utils/dailyAlmanac';
 import type { DailyAlmanac } from '@/utils/dailyAlmanac';
+import { buildProfileFingerprint } from '@/utils/almanacPersonalization';
 import {
   generateAlmanacViaAI,
   buildLocalFallbackWithMeta,
@@ -30,7 +31,9 @@ interface AlmanacState {
   markSeenToday: () => Promise<void>;
   getCached: (dateKey: string) => DailyAlmanac | null;
   hasCached: (dateKey: string) => boolean;
-  /** 仅今日、仅首次打开时调用；历史日绝不生成 */
+  /** 今日需校验档案指纹；历史日只要有缓存即有效 */
+  hasValidCached: (dateKey: string, userProfile?: UserProfile) => boolean;
+  /** 仅今日可生成；历史日绝不生成 */
   ensureTodayAlmanac: (userProfile?: UserProfile) => Promise<DailyAlmanac | null>;
 }
 
@@ -91,6 +94,15 @@ export const useAlmanacStore = create<AlmanacState>((set, get) => ({
       }
 
       const today = getDateKey();
+      const todayEntry = cache[today];
+      const staleToday =
+        todayEntry && todayEntry.profileFingerprint == null;
+      if (staleToday) {
+        const { [today]: _removed, ...rest } = cache;
+        cache = rest;
+        await persistCache(cache);
+      }
+
       set({
         lastSeenDate: lastSeen,
         cache,
@@ -116,13 +128,31 @@ export const useAlmanacStore = create<AlmanacState>((set, get) => ({
 
   hasCached: (dateKey) => !!get().cache[dateKey],
 
+  hasValidCached: (dateKey, userProfile) => {
+    const entry = get().cache[dateKey];
+    if (!entry) return false;
+    if (dateKey !== getDateKey()) return true;
+    return isAlmanacCacheValid(entry, userProfile);
+  },
+
   ensureTodayAlmanac: async (userProfile) => {
     const today = getDateKey();
+    const fingerprint = buildProfileFingerprint(userProfile);
     const cached = get().cache[today];
-    if (cached) return cached;
+    if (cached && isAlmanacCacheValid(cached, userProfile)) return cached;
 
-    if (get().todayRequested) {
-      return get().cache[today] ?? null;
+    if (get().todayRequested && cached?.profileFingerprint === fingerprint) {
+      return cached;
+    }
+
+    if (cached && !isAlmanacCacheValid(cached, userProfile)) {
+      const { [today]: _removed, ...rest } = get().cache;
+      set({ cache: rest, todayRequested: false });
+      try {
+        await persistCache(rest);
+      } catch {
+        // 内存已清，不阻塞
+      }
     }
 
     if (todayGenerationPromise) {
@@ -136,7 +166,7 @@ export const useAlmanacStore = create<AlmanacState>((set, get) => ({
       try {
         almanac = await generateAlmanacViaAI(new Date(), userProfile);
       } catch {
-        almanac = buildLocalFallbackWithMeta(new Date());
+        almanac = buildLocalFallbackWithMeta(new Date(), userProfile);
       }
 
       const nextCache = { ...get().cache, [today]: almanac };

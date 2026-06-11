@@ -39,20 +39,19 @@ import {
 import SplashOverlay from '@/components/SplashOverlay';
 import TypingIndicator from '@/components/TypingIndicator';
 import SetupGateOverlay from '@/components/setup/SetupGateOverlay';
-import AlmanacModal from '@/components/almanac/AlmanacModal';
 import { useFortuneStore } from '@/stores/fortuneStore';
 import { useUserStore } from '@/stores/userStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useCharacterStore } from '@/stores/characterStore';
 import { useMemoryStore } from '@/stores/memoryStore';
-import { useAlmanacStore } from '@/stores/almanacStore';
 import { getSetupStatus } from '@/utils/setupReadiness';
-import { getDateKey } from '@/utils/dailyAlmanac';
 import { useLaunchStore } from '@/stores/launchStore';
 import { fortuneTell, fortuneFollowUp, createRefusalResult, extractRecentRatings } from '@/services/ai';
 import { getCharacterById, CHARACTERS } from '@/constants/characters';
 import { prepareRitual } from '@/rituals/prepareRitual';
-import { isFollowUpTurn, getLastFortuneResult } from '@/utils/conversationMode';
+import { getLastFortuneResult } from '@/utils/conversationMode';
+import { resolveSoloTurnKind } from '@/utils/soloTurnIntent';
+import { soloCasualReply } from '@/services/soloChat';
 import { orchestrateGroupTurn, generateFortuneCommentary } from '@/services/groupChat/orchestrate';
 import {
   resolveCrossReadSource,
@@ -142,9 +141,6 @@ export default function ChatScreen() {
   const recordFactsMemory = useMemoryStore((s) => s.recordFactsMemory);
   const recordUserTextMemory = useMemoryStore((s) => s.recordUserTextMemory);
   const selectedCharacter = getCharacterById(selectedCharacterId);
-  const almanacLoaded = useAlmanacStore((s) => s.isLoaded);
-  const almanacLastSeen = useAlmanacStore((s) => s.lastSeenDate);
-  const markAlmanacSeen = useAlmanacStore((s) => s.markSeenToday);
 
   const [showSplash, setShowSplash] = useState(true);
   const [channelMode, setChannelMode] = useState<ChatChannelMode>('solo');
@@ -166,8 +162,6 @@ export default function ChatScreen() {
   const [ritualHostId, setRitualHostId] = useState<CharacterId>(selectedCharacterId);
   const [shareModalVisible, setShareModalVisible] = useState(false);
   const [shareContent, setShareContent] = useState<SharePosterContent | null>(null);
-  const [almanacVisible, setAlmanacVisible] = useState(false);
-  const [almanacSkipDraw, setAlmanacSkipDraw] = useState(false);
   const channelModeRef = useRef<ChatChannelMode>('solo');
   const [ritualData, setRitualData] = useState<RitualData>({});
   const pendingResultRef = useRef<FortuneResult | null>(null);
@@ -219,46 +213,6 @@ export default function ChatScreen() {
     const timer = setTimeout(() => setShowSplash(false), 2200);
     return () => clearTimeout(timer);
   }, []);
-
-  useEffect(() => {
-    if (showSplash || !almanacLoaded || !settingsLoaded || !profileLoaded) return;
-
-    const today = getDateKey();
-    if (almanacLastSeen === today) return;
-
-    let cancelled = false;
-
-    const prepareTodayAlmanac = async () => {
-      const store = useAlmanacStore.getState();
-      if (!store.hasCached(today)) {
-        if (!setupStatus.isReady) return;
-        await store.ensureTodayAlmanac(profile ?? undefined);
-      }
-
-      if (cancelled) return;
-      if (!useAlmanacStore.getState().hasCached(today)) return;
-      if (useAlmanacStore.getState().lastSeenDate === today) return;
-
-      void markAlmanacSeen();
-      setAlmanacSkipDraw(false);
-      setAlmanacVisible(true);
-    };
-
-    void prepareTodayAlmanac();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    showSplash,
-    almanacLoaded,
-    settingsLoaded,
-    profileLoaded,
-    almanacLastSeen,
-    setupStatus.isReady,
-    profile,
-    markAlmanacSeen,
-  ]);
 
   const openAlmanac = useCallback(() => {
     router.push('/almanac');
@@ -459,7 +413,7 @@ export default function ChatScreen() {
     const modeConfig = FORTUNE_TYPES.find((item) => item.type === mode)!;
     const conversationHistory = messages;
     const anchorResult = getLastFortuneResult(messages);
-    const followUp = isFollowUpTurn(messages);
+    const turnKind = resolveSoloTurnKind({ text, imageUri, messages: conversationHistory });
     const displayContent = text || `[${modeConfig.shortTitle}照片]`;
 
     appendMessages(
@@ -474,7 +428,54 @@ export default function ChatScreen() {
 
     setRitualHostId(selectedCharacterId);
 
-    if (followUp && anchorResult) {
+    if (turnKind === 'chat') {
+      setTypingCharacterId(selectedCharacterId);
+      setLoading(true);
+      const promptMemories = resolvePromptMemories(mode);
+      try {
+        const reply = await soloCasualReply({
+          characterId: selectedCharacterId,
+          scene: mode,
+          conversationHistory,
+          userInput: text ?? '',
+          userProfile: profile ?? undefined,
+          userMemories: promptMemories,
+        });
+        if (text?.trim()) {
+          void recordUserTextMemory(
+            text,
+            mode,
+            activeSessionIdRef.current ?? eventIdRef.current
+          );
+        }
+        void markMemoriesUsed(promptMemories);
+        appendMessages(
+          createMessage({
+            role: 'master',
+            content: reply,
+            mode,
+            characterId: selectedCharacterId,
+          })
+        );
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      } catch (err) {
+        appendMessages(
+          createMessage({
+            role: 'master',
+            content: err instanceof Error ? err.message : '天机紊乱，请稍后再试',
+            mode,
+            characterId: selectedCharacterId,
+            isError: true,
+          })
+        );
+      } finally {
+        setLoading(false);
+        setTypingCharacterId(null);
+      }
+      return;
+    }
+
+    if (turnKind === 'follow_up' && anchorResult) {
       const responderId = resolveRespondingCharacterId({
         channelMode: 'solo',
         selectedCharacterId,
@@ -536,7 +537,7 @@ export default function ChatScreen() {
     pendingErrorRef.current = null;
     pendingCommentaryRef.current = false;
 
-    const prepared = prepareRitual(selectedCharacterId, mode, profile ?? undefined);
+    const prepared = prepareRitual(selectedCharacterId, mode, profile ?? undefined, text);
     setRitualData(prepared.ritualData);
 
     const promptMemories = resolvePromptMemories(mode);
@@ -668,7 +669,7 @@ export default function ChatScreen() {
         pendingResultRef.current = null;
         pendingErrorRef.current = null;
 
-        const prepared = prepareRitual(hostId, mode, profile ?? undefined);
+        const prepared = prepareRitual(hostId, mode, profile ?? undefined, text);
         setRitualData(prepared.ritualData);
 
         const fortuneMemories = resolvePromptMemories(mode);
@@ -782,7 +783,12 @@ export default function ChatScreen() {
       pendingErrorRef.current = null;
       pendingCommentaryRef.current = false;
 
-      const prepared = prepareRitual(targetCharacterId, source.mode, profile ?? undefined);
+      const prepared = prepareRitual(
+        targetCharacterId,
+        source.mode,
+        profile ?? undefined,
+        source.text
+      );
       setRitualData(prepared.ritualData);
 
       const promptMemories = resolvePromptMemories(source.mode);
@@ -1104,46 +1110,18 @@ export default function ChatScreen() {
   );
 
   const handleNewChat = () => {
-    const hasConversation = messages.some((item) => item.role === 'user' || item.role === 'master');
-    const title = channelMode === 'group' ? '新对话' : '新起一卦';
-    const message =
-      channelMode === 'group' ? '清空当前群聊，开始新话题？' : '清空当前对话，开始新的占卜？';
-    if (!hasConversation) {
-      resetChat();
-      return;
-    }
-    Alert.alert(title, message, [
-      { text: '取消', style: 'cancel' },
-      { text: '确定', onPress: () => resetChat() },
-    ]);
+    resetChat();
   };
 
   const handleChannelModeChange = (nextMode: ChatChannelMode) => {
     if (nextMode === channelMode) return;
 
-    const hasConversation = messages.some((item) => item.role === 'user' || item.role === 'master');
-    const applySwitch = () => {
-      setChannelMode(nextMode);
-      resetChat(
-        nextMode,
-        nextMode === 'group'
-          ? '已切换至七仙论道群聊。'
-          : `已切换至私聊模式，当前大仙：${selectedCharacter.name}。`
-      );
-    };
-
-    if (!hasConversation) {
-      applySwitch();
-      return;
-    }
-
-    Alert.alert(
-      '切换聊天模式',
-      '切换将清空当前对话，是否继续？',
-      [
-        { text: '取消', style: 'cancel' },
-        { text: '确定', onPress: applySwitch },
-      ]
+    setChannelMode(nextMode);
+    resetChat(
+      nextMode,
+      nextMode === 'group'
+        ? '已切换至七仙论道群聊。'
+        : `已切换至私聊模式，当前大仙：${selectedCharacter.name}。`
     );
   };
 
@@ -1308,11 +1286,6 @@ export default function ChatScreen() {
         }}
       />
 
-      <AlmanacModal
-        visible={almanacVisible}
-        skipDraw={almanacSkipDraw}
-        onClose={() => setAlmanacVisible(false)}
-      />
     </SafeAreaView>
   );
 }

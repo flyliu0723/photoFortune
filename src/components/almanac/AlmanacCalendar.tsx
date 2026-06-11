@@ -6,6 +6,7 @@ import { cyberTheme } from '@/constants/theme';
 import { FORTUNE_LEVEL_COLOR, type FortuneLevel } from '@/constants/almanac';
 import { getDateKey } from '@/utils/dailyAlmanac';
 import { useAlmanacStore } from '@/stores/almanacStore';
+import type { UserProfile } from '@/types';
 
 const WEEKDAY_LABELS = ['日', '一', '二', '三', '四', '五', '六'];
 
@@ -21,14 +22,16 @@ interface DayCell {
 interface AlmanacCalendarProps {
   /** 选中某一天（今天或过去）时回调 */
   onSelectDay: (date: Date) => void;
+  userProfile?: UserProfile | null;
 }
 
 function startOfDay(date: Date): Date {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate());
 }
 
-export default function AlmanacCalendar({ onSelectDay }: AlmanacCalendarProps) {
+export default function AlmanacCalendar({ onSelectDay, userProfile }: AlmanacCalendarProps) {
   const cache = useAlmanacStore((s) => s.cache);
+  const hasValidCached = useAlmanacStore((s) => s.hasValidCached);
   const today = useMemo(() => startOfDay(new Date()), []);
   const [cursor, setCursor] = useState(() => new Date(today.getFullYear(), today.getMonth(), 1));
 
@@ -52,11 +55,13 @@ export default function AlmanacCalendar({ onSelectDay }: AlmanacCalendarProps) {
         day: d,
         isToday: dateKey === todayKey,
         isFuture: date.getTime() > today.getTime(),
-        level: cache[dateKey]?.level ?? null,
+        level: hasValidCached(dateKey, userProfile ?? undefined)
+          ? (cache[dateKey]?.level ?? null)
+          : null,
       });
     }
     return { cells: list, leadingBlanks: firstDay.getDay() };
-  }, [cursor, cache, today]);
+  }, [cursor, cache, today, hasValidCached, userProfile]);
 
   const drawnCount = useMemo(
     () => cells.filter((c) => c.level).length,
@@ -166,7 +171,7 @@ export default function AlmanacCalendar({ onSelectDay }: AlmanacCalendarProps) {
         ))}
       </View>
 
-      <Text style={styles.hint}>有圆点的日子可回看 · 未来尚未揭晓 · 过期不补签</Text>
+      <Text style={styles.hint}>点今天可求签 · 有圆点可回看 · 未来尚未揭晓 · 过期不补签</Text>
     </View>
   );
 }
