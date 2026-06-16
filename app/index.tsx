@@ -7,6 +7,31 @@ import {
   Platform,
   Alert,
 } from 'react-native';
+import {
+  STALE_REQUEST_MESSAGE,
+  useOperationLifecycle,
+} from '@/hooks/useOperationLifecycle';
+import {
+  clearSessionInFlight,
+  trackChatRequestStart,
+  trackFortuneRitualApiDone,
+  trackFortuneRitualFailed,
+  trackFortuneRitualStart,
+  trackGroupTurnPhase,
+  trackGroupTurnStart,
+  trackCommentaryStart,
+  parseGroupTurnPayload,
+  type FortuneRitualTaskPayload,
+} from '@/services/inFlightTasks';
+import type { InFlightTaskRecord } from '@/services/inFlightTaskDb';
+import { findLaunchRecoveryCandidate, hasCommentaryForTurn } from '@/utils/inFlightRecovery';
+import {
+  buildGroupTurnCheckpointPayload,
+  buildGroupTurnResumeCheckpoint,
+  hasTurnReplyShown,
+  isGroupTurnIncomplete,
+} from '@/utils/groupTurnRecovery';
+import type { GroupTurnOutcome } from '@/services/groupChat/orchestrate';
 import { useRouter, useFocusEffect } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
@@ -67,7 +92,11 @@ import {
   mergeAnchorResult,
   buildFactsSystemMessage,
 } from '@/utils/groupEventState';
-import { buildRestoredSessionMessages, getPersistableMessages } from '@/utils/conversationSession';
+import {
+  buildRestoredSessionMessages,
+  getPersistableMessages,
+  reconcileSessionMessagesWithResult,
+} from '@/utils/conversationSession';
 import type {
   ChatMessage,
   FortuneType,
@@ -132,6 +161,7 @@ export default function ChatScreen() {
     updateSessionMessages,
     pendingRestore,
     setPendingRestore,
+    isLoaded: historyLoaded,
   } = useFortuneStore();
   const selectedCharacterId = useCharacterStore((s) => s.selectedId);
   const setCharacter = useCharacterStore((s) => s.setCharacter);
@@ -169,9 +199,12 @@ export default function ChatScreen() {
   const pendingCommentaryRef = useRef(false);
   const pendingTurnMetaRef = useRef<{ turnId: string; userInput: string } | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const eventIdRef = useRef<string>(createEventId());
   const eventStateRef = useRef<GroupEventState | null>(null);
   const skipSessionSaveRef = useRef(false);
+  const launchRecoveryCheckedRef = useRef(false);
+  const groupResumeInFlightRef = useRef(false);
   const ritualHost = getCharacterById(ritualHostId);
 
   const setupStatus = useMemo(
@@ -268,8 +301,14 @@ export default function ChatScreen() {
       sceneMode: mode,
     });
     activeSessionIdRef.current = sessionId;
+    setActiveSessionId(sessionId);
     return sessionId;
   }, [channelMode, createChatSession, mode]);
+
+  const resolveSessionId = useCallback(
+    () => activeSessionIdRef.current ?? eventIdRef.current,
+    []
+  );
 
   useEffect(() => {
     const sessionId = activeSessionIdRef.current;
@@ -323,6 +362,8 @@ export default function ChatScreen() {
 
       try {
         const promptMemories = resolvePromptMemories(mode);
+        const sessionId = activeSessionIdRef.current ?? eventIdRef.current;
+        await trackCommentaryStart(sessionId, { turnId, userInput, sceneMode: mode });
         await generateFortuneCommentary({
           messages: currentMessages,
           eventState,
@@ -340,6 +381,7 @@ export default function ChatScreen() {
         // 点评失败不影响主流程
       } finally {
         setTypingCharacterId(null);
+        void clearSessionInFlight(activeSessionIdRef.current ?? eventIdRef.current);
       }
     },
     [appendGroupReply, selectedCharacterId, mode, profile, resolvePromptMemories, markMemoriesUsed]
@@ -406,7 +448,377 @@ export default function ChatScreen() {
         })
       );
     }
+
+    const sessionId = activeSessionIdRef.current ?? eventIdRef.current;
+    if (sessionId) {
+      void clearSessionInFlight(sessionId);
+    }
   }, [appendMessages, messages, mode, ritualHostId, runFortuneCommentary]);
+
+  const hasResultInMessages = useCallback(
+    (resultId: string) =>
+      messages.some(
+        (message) => message.role === 'master' && message.result?.id === resultId
+      ),
+    [messages]
+  );
+
+  const applyRecoveredFortune = useCallback(
+    ({
+      result,
+      ritualPayload,
+      skipRitual,
+    }: {
+      result: FortuneResult;
+      ritualPayload: FortuneRitualTaskPayload;
+      skipRitual: boolean;
+    }) => {
+      if (hasResultInMessages(result.id)) {
+        void clearSessionInFlight(resolveSessionId());
+        return;
+      }
+
+      pendingResultRef.current = result;
+      pendingCommentaryRef.current = ritualPayload.pendingCommentary;
+      pendingTurnMetaRef.current = ritualPayload.turnMeta;
+      setRitualHostId(ritualPayload.ritualHostId);
+      setRitualData(ritualPayload.ritualData);
+
+      if (skipRitual) {
+        setRitualVisible(false);
+        setApiReady(false);
+        setLoading(false);
+        setTypingCharacterId(null);
+        finishRitual();
+        return;
+      }
+
+      setRitualVisible(true);
+      setApiReady(true);
+    },
+    [finishRitual, hasResultInMessages, resolveSessionId]
+  );
+
+  const applyRecoveredFortuneError = useCallback(
+    (errorMessage: string, ritualPayload: FortuneRitualTaskPayload) => {
+      if (messages.some((message) => message.isError && message.content === errorMessage)) {
+        void clearSessionInFlight(resolveSessionId());
+        return;
+      }
+      setRitualHostId(ritualPayload.ritualHostId);
+      setRitualData(ritualPayload.ritualData);
+      setRitualVisible(false);
+      setApiReady(false);
+      setLoading(false);
+      setTypingCharacterId(null);
+      pendingResultRef.current = null;
+      pendingErrorRef.current = errorMessage;
+      finishRitual();
+    },
+    [finishRitual, messages, resolveSessionId]
+  );
+
+  const applyRecoveredStaleRequest = useCallback(
+    (_task: InFlightTaskRecord) => {
+      if (messages.some((message) => message.isError && message.content === STALE_REQUEST_MESSAGE)) {
+        void clearSessionInFlight(resolveSessionId());
+        return;
+      }
+      setLoading(false);
+      setTypingCharacterId(null);
+      setRitualVisible(false);
+      setApiReady(false);
+      pendingResultRef.current = null;
+      pendingErrorRef.current = null;
+      pendingCommentaryRef.current = false;
+      appendMessages(
+        createMessage({
+          role: 'master',
+          content: STALE_REQUEST_MESSAGE,
+          mode,
+          characterId: ritualHostId,
+          eventId: eventIdRef.current,
+          isError: true,
+        })
+      );
+      void clearSessionInFlight(resolveSessionId());
+    },
+    [appendMessages, messages, mode, resolveSessionId, ritualHostId]
+  );
+
+  const applyRecoveredCommentary = useCallback(
+    ({ turnId, userInput }: { turnId: string; userInput: string }) => {
+      if (isLoading || ritualVisible) return;
+      if (hasCommentaryForTurn(messages, turnId)) {
+        void clearSessionInFlight(resolveSessionId());
+        return;
+      }
+      void runFortuneCommentary(turnId, userInput);
+    },
+    [isLoading, messages, resolveSessionId, ritualVisible, runFortuneCommentary]
+  );
+
+  const applyGroupTurnOutcome = useCallback(
+    async (
+      outcome: GroupTurnOutcome,
+      ctx: {
+        turnId: string;
+        text?: string;
+        imageUri?: string;
+        conversationHistory: ChatMessage[];
+        groupSessionId: string;
+        promptMemories: import('@/types').UserMemory[];
+        sceneMode: FortuneType;
+        flightFlags: { keepInFlightForRitual: boolean };
+      }
+    ) => {
+      eventStateRef.current = outcome.eventState;
+      void markMemoriesUsed(ctx.promptMemories);
+
+      if (outcome.plan.factsUpdate.length > 0) {
+        void recordFactsMemory(outcome.plan.factsUpdate, ctx.sceneMode, ctx.groupSessionId);
+      }
+
+      const factsMessage = buildFactsSystemMessage(outcome.plan.factsUpdate);
+      if (factsMessage) {
+        appendMessages({ ...factsMessage, eventId: eventIdRef.current });
+      }
+
+      if (outcome.type === 'fortune') {
+        const hostId = outcome.hostCharacterId;
+        const host = getCharacterById(hostId);
+        setRitualHostId(hostId);
+        setTypingCharacterId(hostId);
+        pendingCommentaryRef.current = true;
+        pendingTurnMetaRef.current = { turnId: ctx.turnId, userInput: ctx.text ?? '' };
+        ctx.flightFlags.keepInFlightForRitual = true;
+
+        void trackGroupTurnPhase(ctx.groupSessionId, {
+          turnId: ctx.turnId,
+          userInput: ctx.text ?? '',
+          sceneMode: ctx.sceneMode,
+          phase: 'fortune_pending',
+          imageUri: ctx.imageUri,
+        });
+
+        appendMessages(
+          createMessage({
+            role: 'system',
+            content: `${host.name}·${host.school} 准备为你起卦…`,
+            eventId: eventIdRef.current,
+            turnId: ctx.turnId,
+          })
+        );
+
+        setRitualVisible(true);
+        setApiReady(false);
+        pendingResultRef.current = null;
+        pendingErrorRef.current = null;
+
+        const prepared = prepareRitual(hostId, ctx.sceneMode, profile ?? undefined, ctx.text);
+        setRitualData(prepared.ritualData);
+
+        const ritualPayload: FortuneRitualTaskPayload = {
+          channelMode: 'group',
+          sceneMode: ctx.sceneMode,
+          ritualHostId: hostId,
+          ritualData: prepared.ritualData,
+          pendingCommentary: true,
+          turnMeta: { turnId: ctx.turnId, userInput: ctx.text ?? '' },
+        };
+        void trackFortuneRitualStart(ctx.groupSessionId, ritualPayload);
+
+        const fortuneMemories = resolvePromptMemories(ctx.sceneMode);
+        const result = await fortuneTell(
+          ctx.sceneMode,
+          hostId,
+          ctx.imageUri,
+          profile ?? undefined,
+          ctx.text,
+          {
+            meta: prepared.meta,
+            ritualContext: prepared.ritualContext,
+            conversationHistory: [...ctx.conversationHistory],
+            recentRatings: extractRecentRatings(history),
+            userMemories: fortuneMemories,
+          }
+        );
+
+        await addResult(result, {
+          sessionId: ctx.groupSessionId,
+          channelMode: 'group',
+          sceneMode: ctx.sceneMode,
+        });
+        void recordFortuneMemories({
+          sceneMode: ctx.sceneMode,
+          userInput: ctx.text,
+          result,
+          sessionId: ctx.groupSessionId,
+          messages: ctx.conversationHistory,
+        });
+        void markMemoriesUsed(fortuneMemories);
+        pendingResultRef.current = result;
+        await trackFortuneRitualApiDone(ctx.groupSessionId, ritualPayload, result);
+        setApiReady(true);
+        if (!result.rejected) {
+          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        }
+        return;
+      }
+
+      if (outcome.replies.length === 0) {
+        throw new Error('群聊暂无有效回复，请稍后再试');
+      }
+
+      setTypingCharacterId(outcome.replies[0].characterId);
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    },
+    [
+      addResult,
+      appendMessages,
+      history,
+      markMemoriesUsed,
+      profile,
+      recordFactsMemory,
+      recordFortuneMemories,
+      resolvePromptMemories,
+    ]
+  );
+
+  const resumeGroupTurnFromTask = useCallback(
+    async (task: InFlightTaskRecord) => {
+      if (groupResumeInFlightRef.current || isLoading || ritualVisible) return;
+      if (channelModeRef.current !== 'group') return;
+
+      const payload = parseGroupTurnPayload(task);
+      if (!isGroupTurnIncomplete(messages, payload)) {
+        void clearSessionInFlight(task.sessionId);
+        return;
+      }
+
+      groupResumeInFlightRef.current = true;
+      const groupSessionId = resolveSessionId();
+      const turnId = payload.turnId;
+      const turnBase = {
+        turnId,
+        userInput: payload.userInput,
+        sceneMode: payload.sceneMode,
+        imageUri: payload.imageUri,
+        mentionedIds: payload.mentionedIds,
+      };
+
+      setLoading(true);
+      setMode(payload.sceneMode);
+
+      const responderId =
+        payload.plan?.replies[payload.nextActorIndex ?? 0]?.characterId ??
+        selectedCharacterId;
+      setTypingCharacterId(responderId);
+
+      const flightFlags = { keepInFlightForRitual: false };
+
+      try {
+        const eventState =
+          payload.eventState ??
+          deriveEventState(messages, payload.sceneMode, eventIdRef.current);
+        eventStateRef.current = eventState;
+        const resumeFrom = buildGroupTurnResumeCheckpoint(payload) ?? undefined;
+        const promptMemories = resolvePromptMemories(payload.sceneMode);
+
+        const outcome = await orchestrateGroupTurn({
+          messages,
+          eventState,
+          userInput: payload.userInput,
+          mentionedIds: payload.mentionedIds ?? [],
+          imageUri: payload.imageUri,
+          userProfile: profile ?? undefined,
+          userMemories: promptMemories,
+          fallbackHost: selectedCharacterId,
+          resumeFrom,
+          onDirectorReady: async (checkpoint) => {
+            await trackGroupTurnPhase(
+              groupSessionId,
+              buildGroupTurnCheckpointPayload(turnBase, 'director_done', checkpoint)
+            );
+          },
+          onActorProgress: async (checkpoint) => {
+            await trackGroupTurnPhase(
+              groupSessionId,
+              buildGroupTurnCheckpointPayload(turnBase, 'actors_partial', checkpoint)
+            );
+          },
+          onReply: async (reply) => {
+            const currentMessages = await new Promise<ChatMessage[]>((resolve) => {
+              setMessages((prev) => {
+                resolve(prev);
+                return prev;
+              });
+            });
+            if (hasTurnReplyShown(currentMessages, turnId, reply)) return;
+            setTypingCharacterId(reply.characterId);
+            appendGroupReply(reply, turnId);
+          },
+        });
+
+        await applyGroupTurnOutcome(outcome, {
+          turnId,
+          text: payload.userInput,
+          imageUri: payload.imageUri,
+          conversationHistory: messages,
+          groupSessionId,
+          promptMemories,
+          sceneMode: payload.sceneMode,
+          flightFlags,
+        });
+      } catch (err) {
+        appendMessages(
+          createMessage({
+            role: 'master',
+            content: err instanceof Error ? err.message : '天机紊乱，请稍后再试',
+            mode: payload.sceneMode,
+            characterId: selectedCharacterId,
+            eventId: eventIdRef.current,
+            turnId,
+            isError: true,
+          })
+        );
+        void clearSessionInFlight(groupSessionId);
+      } finally {
+        setLoading(false);
+        setTypingCharacterId(null);
+        groupResumeInFlightRef.current = false;
+        if (!flightFlags.keepInFlightForRitual) {
+          void clearSessionInFlight(groupSessionId);
+        }
+      }
+    },
+    [
+      appendGroupReply,
+      appendMessages,
+      applyGroupTurnOutcome,
+      isLoading,
+      messages,
+      profile,
+      resolvePromptMemories,
+      resolveSessionId,
+      ritualVisible,
+      selectedCharacterId,
+    ]
+  );
+
+  useOperationLifecycle({
+    isBusy: isLoading || ritualVisible,
+    sessionId: activeSessionId,
+    messages,
+    hasResultInMessages,
+    onRecoverFortuneUi: applyRecoveredFortune,
+    onRecoverFortuneError: applyRecoveredFortuneError,
+    onRecoverStaleRequest: applyRecoveredStaleRequest,
+    onRecoverCommentary: applyRecoveredCommentary,
+    onRecoverGroupTurn: (task) => {
+      void resumeGroupTurnFromTask(task);
+    },
+  });
 
   const runSoloFortune = async (payload: { text?: string; imageUri?: string }) => {
     const { text, imageUri } = payload;
@@ -431,6 +843,13 @@ export default function ChatScreen() {
     if (turnKind === 'chat') {
       setTypingCharacterId(selectedCharacterId);
       setLoading(true);
+      const sessionId = resolveSessionId();
+      void trackChatRequestStart(sessionId, {
+        channelMode: 'solo',
+        sceneMode: mode,
+        characterId: selectedCharacterId,
+        kind: 'chat',
+      });
       const promptMemories = resolvePromptMemories(mode);
       try {
         const reply = await soloCasualReply({
@@ -471,6 +890,7 @@ export default function ChatScreen() {
       } finally {
         setLoading(false);
         setTypingCharacterId(null);
+        void clearSessionInFlight(resolveSessionId());
       }
       return;
     }
@@ -484,6 +904,13 @@ export default function ChatScreen() {
       setRitualHostId(responderId);
       setTypingCharacterId(responderId);
       setLoading(true);
+      const sessionId = resolveSessionId();
+      void trackChatRequestStart(sessionId, {
+        channelMode: 'solo',
+        sceneMode: mode,
+        characterId: responderId,
+        kind: 'follow_up',
+      });
       const promptMemories = resolvePromptMemories(mode);
       try {
         const reply = await fortuneFollowUp(
@@ -523,6 +950,7 @@ export default function ChatScreen() {
       } finally {
         setLoading(false);
         setTypingCharacterId(null);
+        void clearSessionInFlight(resolveSessionId());
       }
       return;
     }
@@ -539,6 +967,17 @@ export default function ChatScreen() {
 
     const prepared = prepareRitual(selectedCharacterId, mode, profile ?? undefined, text);
     setRitualData(prepared.ritualData);
+
+    const sessionId = resolveSessionId();
+    const ritualPayload: FortuneRitualTaskPayload = {
+      channelMode: 'solo',
+      sceneMode: mode,
+      ritualHostId: selectedCharacterId,
+      ritualData: prepared.ritualData,
+      pendingCommentary: false,
+      turnMeta: null,
+    };
+    void trackFortuneRitualStart(sessionId, ritualPayload);
 
     const promptMemories = resolvePromptMemories(mode);
     try {
@@ -570,12 +1009,15 @@ export default function ChatScreen() {
       });
       void markMemoriesUsed(promptMemories);
       pendingResultRef.current = result;
+      await trackFortuneRitualApiDone(sessionId, ritualPayload, result);
       setApiReady(true);
       if (!result.rejected) {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       }
     } catch (err) {
-      pendingErrorRef.current = err instanceof Error ? err.message : '天机紊乱，请稍后再试';
+      const errMsg = err instanceof Error ? err.message : '天机紊乱，请稍后再试';
+      pendingErrorRef.current = errMsg;
+      await trackFortuneRitualFailed(sessionId, ritualPayload, errMsg);
       setApiReady(true);
     } finally {
       setLoading(false);
@@ -604,6 +1046,15 @@ export default function ChatScreen() {
     );
 
     setLoading(true);
+    const sessionId = resolveSessionId();
+    void trackGroupTurnStart(sessionId, {
+      turnId,
+      userInput: text ?? '',
+      sceneMode: mode,
+      phase: 'orchestrating',
+      imageUri,
+      mentionedIds,
+    });
     const initialResponder = resolveRespondingCharacterId({
       channelMode: 'group',
       selectedCharacterId,
@@ -613,11 +1064,20 @@ export default function ChatScreen() {
     setTypingCharacterId(initialResponder);
 
     const promptMemories = resolvePromptMemories(mode);
-    const sessionId = activeSessionIdRef.current ?? eventIdRef.current;
+    const groupSessionId = activeSessionIdRef.current ?? eventIdRef.current;
+    let keepInFlightForRitual = false;
+    const turnBase = {
+      turnId,
+      userInput: text ?? '',
+      sceneMode: mode,
+      imageUri,
+      mentionedIds,
+    };
+    const flightFlags = { keepInFlightForRitual: false };
 
     try {
       if (text?.trim()) {
-        void recordUserTextMemory(text, mode, sessionId);
+        void recordUserTextMemory(text, mode, groupSessionId);
       }
 
       const outcome = await orchestrateGroupTurn({
@@ -629,92 +1089,35 @@ export default function ChatScreen() {
         userProfile: profile ?? undefined,
         userMemories: promptMemories,
         fallbackHost: selectedCharacterId,
+        onDirectorReady: async (checkpoint) => {
+          await trackGroupTurnPhase(
+            groupSessionId,
+            buildGroupTurnCheckpointPayload(turnBase, 'director_done', checkpoint)
+          );
+        },
+        onActorProgress: async (checkpoint) => {
+          await trackGroupTurnPhase(
+            groupSessionId,
+            buildGroupTurnCheckpointPayload(turnBase, 'actors_partial', checkpoint)
+          );
+        },
         onReply: async (reply) => {
           setTypingCharacterId(reply.characterId);
           appendGroupReply(reply, turnId);
         },
       });
 
-      eventStateRef.current = outcome.eventState;
-      void markMemoriesUsed(promptMemories);
-
-      if (outcome.plan.factsUpdate.length > 0) {
-        void recordFactsMemory(outcome.plan.factsUpdate, mode, sessionId);
-      }
-
-      const factsMessage = buildFactsSystemMessage(outcome.plan.factsUpdate);
-      if (factsMessage) {
-        appendMessages({ ...factsMessage, eventId: eventIdRef.current });
-      }
-
-      if (outcome.type === 'fortune') {
-        const hostId = outcome.hostCharacterId;
-        const host = getCharacterById(hostId);
-        setRitualHostId(hostId);
-        setTypingCharacterId(hostId);
-        pendingCommentaryRef.current = true;
-        pendingTurnMetaRef.current = { turnId, userInput: text ?? '' };
-
-        appendMessages(
-          createMessage({
-            role: 'system',
-            content: `${host.name}·${host.school} 准备为你起卦…`,
-            eventId: eventIdRef.current,
-            turnId,
-          })
-        );
-
-        setRitualVisible(true);
-        setApiReady(false);
-        pendingResultRef.current = null;
-        pendingErrorRef.current = null;
-
-        const prepared = prepareRitual(hostId, mode, profile ?? undefined, text);
-        setRitualData(prepared.ritualData);
-
-        const fortuneMemories = resolvePromptMemories(mode);
-        const result = await fortuneTell(
-          mode,
-          hostId,
-          imageUri,
-          profile ?? undefined,
-          text,
-          {
-            meta: prepared.meta,
-            ritualContext: prepared.ritualContext,
-            conversationHistory: [...conversationHistory],
-            recentRatings: extractRecentRatings(history),
-            userMemories: fortuneMemories,
-          }
-        );
-
-        await addResult(result, {
-          sessionId: activeSessionIdRef.current ?? eventIdRef.current,
-          channelMode: 'group',
-          sceneMode: mode,
-        });
-        void recordFortuneMemories({
-          sceneMode: mode,
-          userInput: text,
-          result,
-          sessionId: activeSessionIdRef.current ?? eventIdRef.current,
-          messages: conversationHistory,
-        });
-        void markMemoriesUsed(fortuneMemories);
-        pendingResultRef.current = result;
-        setApiReady(true);
-        if (!result.rejected) {
-          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        }
-        return;
-      }
-
-      if (outcome.replies.length === 0) {
-        throw new Error('群聊暂无有效回复，请稍后再试');
-      }
-
-      setTypingCharacterId(outcome.replies[0].characterId);
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      await applyGroupTurnOutcome(outcome, {
+        turnId,
+        text,
+        imageUri,
+        conversationHistory,
+        groupSessionId,
+        promptMemories,
+        sceneMode: mode,
+        flightFlags,
+      });
+      keepInFlightForRitual = flightFlags.keepInFlightForRitual;
     } catch (err) {
       appendMessages(
         createMessage({
@@ -730,6 +1133,9 @@ export default function ChatScreen() {
     } finally {
       setLoading(false);
       setTypingCharacterId(null);
+      if (!keepInFlightForRitual) {
+        void clearSessionInFlight(groupSessionId);
+      }
     }
   };
 
@@ -791,6 +1197,17 @@ export default function ChatScreen() {
       );
       setRitualData(prepared.ritualData);
 
+      const crossSessionId = activeSessionIdRef.current ?? eventIdRef.current;
+      const crossRitualPayload: FortuneRitualTaskPayload = {
+        channelMode: 'solo',
+        sceneMode: source.mode,
+        ritualHostId: targetCharacterId,
+        ritualData: prepared.ritualData,
+        pendingCommentary: false,
+        turnMeta: null,
+      };
+      void trackFortuneRitualStart(crossSessionId, crossRitualPayload);
+
       const promptMemories = resolvePromptMemories(source.mode);
       try {
         const result = await fortuneTell(
@@ -831,12 +1248,15 @@ export default function ChatScreen() {
         });
         void markMemoriesUsed(promptMemories);
         pendingResultRef.current = enriched;
+        await trackFortuneRitualApiDone(crossSessionId, crossRitualPayload, enriched);
         setApiReady(true);
         if (!enriched.rejected) {
           await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         }
       } catch (err) {
-        pendingErrorRef.current = err instanceof Error ? err.message : '天机紊乱，请稍后再试';
+        const errMsg = err instanceof Error ? err.message : '天机紊乱，请稍后再试';
+        pendingErrorRef.current = errMsg;
+        await trackFortuneRitualFailed(crossSessionId, crossRitualPayload, errMsg);
         setApiReady(true);
       } finally {
         setLoading(false);
@@ -942,10 +1362,19 @@ export default function ChatScreen() {
       setChannelMode(restoredChannelMode);
       setMode(restoredSceneMode);
       activeSessionIdRef.current = session.id;
+      setActiveSessionId(session.id);
       eventIdRef.current = session.id;
       skipSessionSaveRef.current = true;
 
-      const restored = buildRestoredSessionMessages(session);
+      const reconciledMessages = reconcileSessionMessagesWithResult(session);
+      if (reconciledMessages.length !== (session.messages?.length ?? 0)) {
+        await updateSessionMessages(session.id, reconciledMessages);
+      }
+
+      const restored = buildRestoredSessionMessages({
+        ...session,
+        messages: reconciledMessages,
+      });
       setMessages(restored);
       eventStateRef.current = deriveEventState(restored, restoredSceneMode, session.id);
       setRitualHostId(session.result?.characterId ?? selectedCharacterId);
@@ -959,7 +1388,49 @@ export default function ChatScreen() {
     return () => {
       cancelled = true;
     };
-  }, [pendingRestore, selectedCharacterId, setCharacter, setPendingRestore, scrollToEnd]);
+  }, [pendingRestore, selectedCharacterId, setCharacter, setPendingRestore, scrollToEnd, updateSessionMessages]);
+
+  useEffect(() => {
+    if (!historyLoaded || showSplash || pendingRestore || activeSessionId) return;
+    if (launchRecoveryCheckedRef.current) return;
+
+    launchRecoveryCheckedRef.current = true;
+
+    let cancelled = false;
+
+    (async () => {
+      const candidate = await findLaunchRecoveryCandidate(history);
+      if (cancelled || !candidate) return;
+
+      const session = history.find((item) => item.id === candidate.sessionId);
+      if (!session) return;
+
+      const alertCopy =
+        candidate.reason === 'fortune_error'
+          ? {
+              title: '有未展示的占卜错误',
+              message: '检测到上次起卦出错但尚未展示，是否恢复该会话？',
+            }
+          : candidate.reason === 'group_turn_partial'
+            ? {
+                title: '有未完成的群聊回复',
+                message: '检测到上次群聊回复尚未完成，是否恢复该会话并继续？',
+              }
+            : {
+                title: '有未展示的卦象',
+                message: '检测到上次起卦已完成但尚未展示，是否恢复该会话？',
+              };
+
+      Alert.alert(alertCopy.title, alertCopy.message, [
+        { text: '稍后', style: 'cancel' },
+        { text: '恢复会话', onPress: () => setPendingRestore(session) },
+      ]);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [historyLoaded, showSplash, pendingRestore, activeSessionId, history, setPendingRestore]);
 
   const handleShareConversation = useCallback(async () => {
     const shareable = getShareableMessages(messages);
@@ -1058,6 +1529,7 @@ export default function ChatScreen() {
   const resetChat = useCallback(
     (nextChannelMode: ChatChannelMode = channelMode, systemNotice?: string) => {
       activeSessionIdRef.current = null;
+      setActiveSessionId(null);
       skipSessionSaveRef.current = true;
       eventIdRef.current = createEventId();
       eventStateRef.current = null;

@@ -112,15 +112,22 @@ export interface GenerateActorRepliesInput {
   userProfile?: UserProfile;
   userMemories?: UserMemory[];
   imageUri?: string;
+  initialReplies?: GeneratedGroupReply[];
+  startIndex?: number;
   onReply?: (reply: GeneratedGroupReply) => void | Promise<void>;
+  onProgress?: (progress: {
+    completedReplies: GeneratedGroupReply[];
+    nextActorIndex: number;
+  }) => void | Promise<void>;
 }
 
 export async function generateActorReplies(
   input: GenerateActorRepliesInput
 ): Promise<GeneratedGroupReply[]> {
-  const replies: GeneratedGroupReply[] = [];
+  const replies: GeneratedGroupReply[] = [...(input.initialReplies ?? [])];
+  const startIndex = input.startIndex ?? 0;
 
-  for (let index = 0; index < input.plans.length; index += 1) {
+  for (let index = startIndex; index < input.plans.length; index += 1) {
     const plan = input.plans[index];
     const reply = await generateActorReply({
       plan,
@@ -136,11 +143,13 @@ export async function generateActorReplies(
     });
 
     if (!isMeaningfulReply(reply.content)) {
+      await input.onProgress?.({ completedReplies: replies, nextActorIndex: index + 1 });
       continue;
     }
 
     replies.push(reply);
     await input.onReply?.(reply);
+    await input.onProgress?.({ completedReplies: replies, nextActorIndex: index + 1 });
   }
 
   return replies;

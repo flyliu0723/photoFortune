@@ -106,9 +106,35 @@ export function migrateHistoryToSessions(raw: unknown): FortuneSession[] {
   );
 }
 
+/** 会话已落库占卜结果但聊天气泡缺失时补全 */
+export function reconcileSessionMessagesWithResult(session: FortuneSession): ChatMessage[] {
+  const messages = [...(session.messages ?? [])];
+  const result = session.result;
+  if (!result || result.rejected) return messages;
+
+  const hasResultBubble = messages.some(
+    (message) =>
+      message.role === 'master' && message.result?.id === result.id && !message.isError
+  );
+  if (hasResultBubble) return messages;
+
+  const restoredMode = isFortuneType(result.type) ? result.type : session.sceneMode;
+  messages.push({
+    id: `${result.id}-recovered`,
+    role: 'master',
+    content: result.summary,
+    mode: restoredMode,
+    characterId: result.characterId,
+    result,
+    createdAt: result.createdAt,
+  });
+  return messages;
+}
+
 export function buildRestoredSessionMessages(session: FortuneSession): ChatMessage[] {
   const channelMode = session.channelMode ?? 'solo';
   const welcome = channelMode === 'group' ? GROUP_WELCOME_MESSAGE : SOLO_WELCOME_MESSAGE;
+  const reconciledMessages = reconcileSessionMessagesWithResult(session);
 
   return [
     {
@@ -117,6 +143,6 @@ export function buildRestoredSessionMessages(session: FortuneSession): ChatMessa
       content: welcome,
       createdAt: session.createdAt ?? session.updatedAt,
     },
-    ...session.messages,
+    ...reconciledMessages,
   ];
 }

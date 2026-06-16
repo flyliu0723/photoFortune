@@ -25,6 +25,13 @@ export type GroupTurnOutcome =
       eventState: GroupEventState;
     };
 
+export interface GroupTurnActorCheckpoint {
+  plan: DirectorPlan;
+  eventState: GroupEventState;
+  completedReplies: GeneratedGroupReply[];
+  nextActorIndex: number;
+}
+
 function applyFactsUpdate(
   eventState: GroupEventState,
   plan: DirectorPlan
@@ -45,28 +52,39 @@ export interface OrchestrateGroupTurnInput {
   userProfile?: UserProfile;
   userMemories?: UserMemory[];
   fallbackHost: CharacterId;
+  resumeFrom?: GroupTurnActorCheckpoint;
+  onDirectorReady?: (checkpoint: GroupTurnActorCheckpoint) => void | Promise<void>;
+  onActorProgress?: (checkpoint: GroupTurnActorCheckpoint) => void | Promise<void>;
   onReply?: (reply: GeneratedGroupReply) => void | Promise<void>;
 }
 
 export async function orchestrateGroupTurn(
   input: OrchestrateGroupTurnInput
 ): Promise<GroupTurnOutcome> {
-  const plan = await planGroupTurn({
-    messages: input.messages,
-    eventState: input.eventState,
-    userInput: input.userInput,
-    mentionedIds: input.mentionedIds,
-    hasImage: !!input.imageUri,
-    fallbackHost: input.fallbackHost,
-  });
+  let plan: DirectorPlan;
+  let nextEventState: GroupEventState;
 
-  const nextEventState = applyFactsUpdate(
-    {
-      ...input.eventState,
-      topic: plan.eventSummary || input.eventState.topic,
-    },
-    plan
-  );
+  if (input.resumeFrom) {
+    plan = input.resumeFrom.plan;
+    nextEventState = input.resumeFrom.eventState;
+  } else {
+    plan = await planGroupTurn({
+      messages: input.messages,
+      eventState: input.eventState,
+      userInput: input.userInput,
+      mentionedIds: input.mentionedIds,
+      hasImage: !!input.imageUri,
+      fallbackHost: input.fallbackHost,
+    });
+
+    nextEventState = applyFactsUpdate(
+      {
+        ...input.eventState,
+        topic: plan.eventSummary || input.eventState.topic,
+      },
+      plan
+    );
+  }
 
   if (plan.turnMode === 'fortune') {
     const hostCharacterId = plan.hostCharacterId ?? input.fallbackHost;
@@ -76,6 +94,15 @@ export async function orchestrateGroupTurn(
       hostCharacterId,
       eventState: nextEventState,
     };
+  }
+
+  if (!input.resumeFrom) {
+    await input.onDirectorReady?.({
+      plan,
+      eventState: nextEventState,
+      completedReplies: [],
+      nextActorIndex: 0,
+    });
   }
 
   const transcript = buildGroupTranscript(input.messages);
@@ -100,7 +127,17 @@ export async function orchestrateGroupTurn(
     userProfile: input.userProfile,
     userMemories: input.userMemories,
     imageUri: input.imageUri,
+    initialReplies: input.resumeFrom?.completedReplies,
+    startIndex: input.resumeFrom?.nextActorIndex,
     onReply: input.onReply,
+    onProgress: async (progress) => {
+      await input.onActorProgress?.({
+        plan,
+        eventState: nextEventState,
+        completedReplies: progress.completedReplies,
+        nextActorIndex: progress.nextActorIndex,
+      });
+    },
   });
 
   if (replies.length === 0) {

@@ -1,4 +1,5 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { AppState } from 'react-native';
 import * as Haptics from 'expo-haptics';
 
 interface UseRitualCompleteOptions {
@@ -18,6 +19,19 @@ export function useRitualComplete({
 }: UseRitualCompleteOptions) {
   const completedRef = useRef(false);
   const startTimeRef = useRef(0);
+  const onCompleteRef = useRef(onComplete);
+  const [foregroundTick, setForegroundTick] = useState(0);
+
+  onCompleteRef.current = onComplete;
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        setForegroundTick((tick) => tick + 1);
+      }
+    });
+    return () => subscription.remove();
+  }, []);
 
   useEffect(() => {
     if (!visible) {
@@ -38,9 +52,9 @@ export function useRitualComplete({
       if (completedRef.current) return;
       completedRef.current = true;
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      onComplete();
+      onCompleteRef.current();
     }, delay);
 
     return () => clearTimeout(timer);
-  }, [visible, ready, canComplete, minMs, onComplete]);
+  }, [visible, ready, canComplete, minMs, foregroundTick]);
 }

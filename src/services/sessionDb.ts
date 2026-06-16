@@ -151,6 +151,21 @@ async function getDb(): Promise<SQLite.SQLiteDatabase> {
           key TEXT PRIMARY KEY NOT NULL,
           value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS in_flight_tasks (
+          id TEXT PRIMARY KEY NOT NULL,
+          session_id TEXT NOT NULL,
+          task_type TEXT NOT NULL,
+          status TEXT NOT NULL,
+          payload_json TEXT NOT NULL DEFAULT '{}',
+          result_json TEXT,
+          error_message TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_in_flight_tasks_session
+          ON in_flight_tasks(session_id);
+        CREATE INDEX IF NOT EXISTS idx_in_flight_tasks_status
+          ON in_flight_tasks(status, updated_at DESC);
       `);
       await migrateFromAsyncStorage(db);
       await trimSessions(db, APP_CONFIG.maxHistoryRecords);

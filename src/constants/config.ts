@@ -23,6 +23,8 @@ export const APP_CONFIG = {
   maxMemoriesPerCategory: 8,
   maxMemoryPromptChars: 400,
   memoryPromptCount: 6,
+  /** 进行中任务超过此时长视为中断（略大于 AI 请求超时） */
+  inFlightStaleMs: 75_000,
 } as const;
 
 export const MEMORY_CATEGORY_LABELS: Record<
