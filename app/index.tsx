@@ -291,6 +291,17 @@ export default function ChatScreen() {
     [scrollToEnd]
   );
 
+  const getCurrentMessages = useCallback(
+    () =>
+      new Promise<ChatMessage[]>((resolve) => {
+        setMessages((prev) => {
+          resolve(prev);
+          return prev;
+        });
+      }),
+    []
+  );
+
   const ensureActiveSession = useCallback(async () => {
     if (activeSessionIdRef.current) return activeSessionIdRef.current;
 
@@ -822,21 +833,9 @@ export default function ChatScreen() {
 
   const runSoloFortune = async (payload: { text?: string; imageUri?: string }) => {
     const { text, imageUri } = payload;
-    const modeConfig = FORTUNE_TYPES.find((item) => item.type === mode)!;
-    const conversationHistory = messages;
-    const anchorResult = getLastFortuneResult(messages);
+    const conversationHistory = await getCurrentMessages();
+    const anchorResult = getLastFortuneResult(conversationHistory);
     const turnKind = resolveSoloTurnKind({ text, imageUri, messages: conversationHistory });
-    const displayContent = text || `[${modeConfig.shortTitle}照片]`;
-
-    appendMessages(
-      createMessage({
-        role: 'user',
-        content: displayContent,
-        mode,
-        imageUri,
-        eventId: eventIdRef.current,
-      })
-    );
 
     setRitualHostId(selectedCharacterId);
 
@@ -1024,26 +1023,16 @@ export default function ChatScreen() {
     }
   };
 
-  const runGroupFortune = async (payload: { text?: string; imageUri?: string }) => {
-    const { text, imageUri } = payload;
-    const modeConfig = FORTUNE_TYPES.find((item) => item.type === mode)!;
+  const runGroupFortune = async (payload: {
+    text?: string;
+    imageUri?: string;
+    turnId: string;
+  }) => {
+    const { text, imageUri, turnId } = payload;
     const mentionedIds = parseMentions(text);
-    const turnId = createTurnId();
-    const eventState = deriveEventState(messages, mode, eventIdRef.current);
+    const conversationHistory = await getCurrentMessages();
+    const eventState = deriveEventState(conversationHistory, mode, eventIdRef.current);
     eventStateRef.current = eventState;
-    const conversationHistory = messages;
-    const displayContent = text || `[${modeConfig.shortTitle}照片]`;
-
-    appendMessages(
-      createMessage({
-        role: 'user',
-        content: displayContent,
-        mode,
-        imageUri,
-        eventId: eventIdRef.current,
-        turnId,
-      })
-    );
 
     setLoading(true);
     const sessionId = resolveSessionId();
@@ -1275,67 +1264,83 @@ export default function ChatScreen() {
     ]
   );
 
-  const runFortune = async (payload: { text?: string; imageUri?: string }) => {
-    if (!guardOperation()) return;
+  const runFortune = async (payload: {
+    text?: string;
+    imageUri?: string;
+  }): Promise<boolean> => {
+    if (!guardOperation()) return false;
 
     const { text, imageUri } = payload;
     const modeConfig = FORTUNE_TYPES.find((item) => item.type === mode)!;
 
-    if (modeConfig.requiresText && !text?.trim()) {
-      Alert.alert('提示', '拍卦模式需要输入碎碎念');
-      return;
-    }
-    if (modeConfig.requiresText && !imageUri) {
-      Alert.alert('提示', '拍卦模式需要拍一张照片');
-      return;
-    }
     if (!text?.trim() && !imageUri) {
-      Alert.alert('提示', '请拍照或输入内容');
-      return;
+      Alert.alert('提示', '请输入内容或拍一张照片');
+      return false;
     }
 
-    await ensureActiveSession();
+    const turnId = channelMode === 'group' ? createTurnId() : undefined;
+    const displayContent = text || `[${modeConfig.shortTitle}照片]`;
 
-    if (text) {
-      const moderation = checkInputModeration(text);
-      if (moderation.blocked) {
-        const hostId =
-          channelMode === 'group'
-            ? (parseMentions(text)[0] ?? selectedCharacterId)
-            : selectedCharacterId;
-        const userMsg =
-          channelMode === 'group'
-            ? createMessage({
-                role: 'user',
-                content: text,
-                mode,
-                imageUri,
-                eventId: eventIdRef.current,
-                turnId: createTurnId(),
-              })
-            : createMessage({
-                role: 'user',
-                content: text,
-                mode,
-                imageUri,
-                eventId: eventIdRef.current,
-              });
-        appendMessages(userMsg);
-        const refusal = createRefusalResult(mode, hostId, moderation.refusalMessage!, imageUri);
-        await addResult(refusal, {
-          sessionId: activeSessionIdRef.current ?? eventIdRef.current,
-          channelMode,
-          sceneMode: mode,
-        });
-        setRefusalResult(refusal);
-        return;
+    appendMessages(
+      createMessage({
+        role: 'user',
+        content: displayContent,
+        mode,
+        imageUri,
+        eventId: eventIdRef.current,
+        turnId,
+      })
+    );
+
+    try {
+      await ensureActiveSession();
+      await clearSessionInFlight(resolveSessionId());
+
+      if (text) {
+        const moderation = checkInputModeration(text);
+        if (moderation.blocked) {
+          const hostId =
+            channelMode === 'group'
+              ? (parseMentions(text)[0] ?? selectedCharacterId)
+              : selectedCharacterId;
+          const refusal = createRefusalResult(
+            mode,
+            hostId,
+            moderation.refusalMessage!,
+            imageUri
+          );
+          await addResult(refusal, {
+            sessionId: activeSessionIdRef.current ?? eventIdRef.current,
+            channelMode,
+            sceneMode: mode,
+          });
+          setRefusalResult(refusal);
+          return true;
+        }
       }
-    }
 
-    if (channelMode === 'group') {
-      await runGroupFortune(payload);
-    } else {
-      await runSoloFortune(payload);
+      if (channelMode === 'group') {
+        await runGroupFortune({ text, imageUri, turnId: turnId! });
+      } else {
+        await runSoloFortune({ text, imageUri });
+      }
+      return true;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : '发送失败，请稍后再试';
+      appendMessages(
+        createMessage({
+          role: 'master',
+          content: errMsg,
+          mode,
+          characterId: selectedCharacterId,
+          eventId: eventIdRef.current,
+          turnId,
+          isError: true,
+        })
+      );
+      void clearSessionInFlight(resolveSessionId());
+      Alert.alert('发送失败', errMsg);
+      return false;
     }
   };
 
@@ -1393,6 +1398,7 @@ export default function ChatScreen() {
   useEffect(() => {
     if (!historyLoaded || showSplash || pendingRestore || activeSessionId) return;
     if (launchRecoveryCheckedRef.current) return;
+    if (messages.some((item) => item.role === 'user')) return;
 
     launchRecoveryCheckedRef.current = true;
 
@@ -1430,7 +1436,7 @@ export default function ChatScreen() {
     return () => {
       cancelled = true;
     };
-  }, [historyLoaded, showSplash, pendingRestore, activeSessionId, history, setPendingRestore]);
+  }, [historyLoaded, showSplash, pendingRestore, activeSessionId, history, messages, setPendingRestore]);
 
   const handleShareConversation = useCallback(async () => {
     const shareable = getShareableMessages(messages);

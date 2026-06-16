@@ -30,7 +30,7 @@ interface ChatInputBarProps {
   onOpenCamera: () => void;
   onOpenMention?: () => void;
   showMentionButton?: boolean;
-  onSubmit: (payload: { text?: string; imageUri?: string }) => void;
+  onSubmit: (payload: { text?: string; imageUri?: string }) => void | Promise<boolean | void>;
   insertMention?: CharacterId | null;
   onMentionInserted?: () => void;
 }
@@ -90,23 +90,27 @@ export default function ChatInputBar({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode]);
 
-  const canSend = (() => {
-    if (disabled) return false;
-    if (modeConfig.requiresText) {
-      return !!text.trim() && !!pendingImage;
-    }
-    return !!text.trim() || !!pendingImage;
-  })();
+  const canSend = !disabled && (!!text.trim() || !!pendingImage);
 
   const handleSend = async () => {
     if (!canSend) return;
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    onSubmit({
-      text: text.trim() || undefined,
-      imageUri: pendingImage ?? undefined,
-    });
-    setText('');
-    onPendingImageChange(null);
+    const draftText = text;
+    const draftImage = pendingImage;
+    const payload = {
+      text: draftText.trim() || undefined,
+      imageUri: draftImage ?? undefined,
+    };
+
+    try {
+      const accepted = await onSubmit(payload);
+      if (accepted === false) return;
+      setText('');
+      onPendingImageChange(null);
+    } catch {
+      setText(draftText);
+      onPendingImageChange(draftImage);
+    }
   };
 
   return (

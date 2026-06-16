@@ -179,6 +179,23 @@ export async function initSessionDb(): Promise<void> {
   await getDb();
 }
 
+/** 串行化写入，避免与 in_flight_tasks 并发写锁冲突 */
+export function runDbWrite<T>(
+  task: (db: SQLite.SQLiteDatabase) => Promise<T>
+): Promise<T> {
+  return enqueueWrite(async () => {
+    const db = await getDb();
+    return task(db);
+  });
+}
+
+export async function runDbRead<T>(
+  task: (db: SQLite.SQLiteDatabase) => Promise<T>
+): Promise<T> {
+  const db = await getDb();
+  return task(db);
+}
+
 export async function listFortuneSessions(
   limit: number = APP_CONFIG.maxHistoryRecords
 ): Promise<FortuneSession[]> {

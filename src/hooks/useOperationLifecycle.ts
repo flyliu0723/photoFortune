@@ -104,6 +104,7 @@ async function recoverSessionTask(
   }
 
   if (task.status === 'running' && isTaskStale(task, APP_CONFIG.inFlightStaleMs)) {
+    if (options.isBusy) return;
     options.onRecoverStaleRequest(task);
   }
 }

@@ -1,6 +1,4 @@
-import * as SQLite from 'expo-sqlite';
-
-const DB_NAME = 'guaji.db';
+import { runDbRead, runDbWrite } from '@/services/sessionDb';
 
 export type InFlightTaskType =
   | 'fortune_ritual'
@@ -48,64 +46,64 @@ function rowToRecord(row: InFlightTaskRow): InFlightTaskRecord {
   };
 }
 
-async function openDb(): Promise<SQLite.SQLiteDatabase> {
-  return SQLite.openDatabaseAsync(DB_NAME);
-}
-
 export async function upsertInFlightTask(
   record: Omit<InFlightTaskRecord, 'createdAt' | 'updatedAt'> & {
     createdAt?: string;
     updatedAt?: string;
   }
 ): Promise<void> {
-  const db = await openDb();
   const now = new Date().toISOString();
   const createdAt = record.createdAt ?? now;
   const updatedAt = record.updatedAt ?? now;
 
-  await db.runAsync(
-    `INSERT OR REPLACE INTO in_flight_tasks (
-      id, session_id, task_type, status, payload_json,
-      result_json, error_message, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    record.id,
-    record.sessionId,
-    record.taskType,
-    record.status,
-    record.payloadJson,
-    record.resultJson,
-    record.errorMessage,
-    createdAt,
-    updatedAt
+  await runDbWrite((db) =>
+    db.runAsync(
+      `INSERT OR REPLACE INTO in_flight_tasks (
+        id, session_id, task_type, status, payload_json,
+        result_json, error_message, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      record.id,
+      record.sessionId,
+      record.taskType,
+      record.status,
+      record.payloadJson,
+      record.resultJson,
+      record.errorMessage,
+      createdAt,
+      updatedAt
+    )
   );
 }
 
 export async function getInFlightTaskBySession(
   sessionId: string
 ): Promise<InFlightTaskRecord | null> {
-  const db = await openDb();
-  const row = await db.getFirstAsync<InFlightTaskRow>(
-    `SELECT * FROM in_flight_tasks
-     WHERE session_id = ?
-     ORDER BY updated_at DESC
-     LIMIT 1`,
-    sessionId
-  );
-  return row ? rowToRecord(row) : null;
+  return runDbRead(async (db) => {
+    const row = await db.getFirstAsync<InFlightTaskRow>(
+      `SELECT * FROM in_flight_tasks
+       WHERE session_id = ?
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      sessionId
+    );
+    return row ? rowToRecord(row) : null;
+  });
 }
 
 export async function clearInFlightTask(sessionId: string): Promise<void> {
-  const db = await openDb();
-  await db.runAsync('DELETE FROM in_flight_tasks WHERE session_id = ?', sessionId);
+  await runDbWrite((db) =>
+    db.runAsync('DELETE FROM in_flight_tasks WHERE session_id = ?', sessionId)
+  );
 }
 
 export async function listRecoverableInFlightTasks(): Promise<InFlightTaskRecord[]> {
-  const db = await openDb();
-  const rows = await db.getAllAsync<InFlightTaskRow>(
-    `SELECT * FROM in_flight_tasks
-     WHERE status IN ('api_done', 'failed', 'running')
-     ORDER BY updated_at DESC
-     LIMIT 5`
-  );
-  return rows.map(rowToRecord);
+  return runDbRead(async (db) => {
+    const rows = await db.getAllAsync<InFlightTaskRow>(
+      `SELECT * FROM in_flight_tasks
+       WHERE status IN ('api_done', 'failed', 'running')
+       ORDER BY updated_at DESC
+       LIMIT 5`
+    );
+    return rows.map(rowToRecord);
+  });
 }

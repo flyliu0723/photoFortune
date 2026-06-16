@@ -32,7 +32,7 @@ module.exports = {
   expo: {
     name: '卦叽',
     slug: 'guaji',
-    version: '1.0.0',
+    version: '1.0.1',
     orientation: 'portrait',
     icon: './assets/icon.png',
     userInterfaceStyle: 'dark',
