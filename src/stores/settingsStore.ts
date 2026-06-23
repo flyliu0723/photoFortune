@@ -15,7 +15,6 @@ import {
   type TestAIConnectionOptions,
   type TestAIConnectionResult,
 } from '@/services/ai';
-import { seedBundledAiDefaultsIfNeeded } from '@/services/bundledAiSeed';
 import { guessDefaultModel, pickPreferredModel } from '@/constants/aiProviders';
 import type { AIProfile, AISettings } from '@/types';
 
@@ -84,7 +83,6 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   testResult: null,
 
   loadSettings: async () => {
-    await seedBundledAiDefaultsIfNeeded();
     const [profiles, data] = await Promise.all([loadAIProfiles(), loadAIProfilesData()]);
     const fallbackId = profiles[0]?.id ?? '';
     set({

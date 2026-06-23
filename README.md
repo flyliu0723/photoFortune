@@ -108,18 +108,6 @@ npm run web       # Web 预览
 
 内置预设可在设置页快速切换：豆包、OpenAI、DeepSeek、Moonshot、商汤。
 
-#### 打包默认配置（可选，不提交 Git）
-
-若希望**首次安装**时自动填入 AI 配置（用户仍可在设置里随时修改）：
-
-1. 复制 `.env.example` 为 `.env.local`
-2. 填写 `GUAJI_AI_API_KEY` 等变量（`.env.local` 已在 `.gitignore` 中）
-3. 重新启动开发服务器或打包
-
-构建时 `app.config.js` 会读取 `.env.local` 并注入 `extra.bundledAi`。**仅在首次安装且本地尚无 API Key 时写入一次**，之后以用户在设置中的配置为准。
-
-> 注意：密钥会打进安装包，适合自用或内测；公开发布请改用服务端代理。
-
 ### 出生档案
 
 用于八字、星座等角色的个性化解读，包含昵称、性别、出生日期与时辰等字段。

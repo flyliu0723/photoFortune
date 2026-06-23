@@ -30,11 +30,10 @@ yarn-error.*
 .DS_Store
 *.pem
 
-# local env files（构建默认 AI 配置，不提交 Git）
+# local env files
 .env
 .env.local
 .env*.local
-!.env.example
 
 # typescript
 *.tsbuildinfo
